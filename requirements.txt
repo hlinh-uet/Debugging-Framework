@@ -1,0 +1,7 @@
+# Runtime dependencies are intentionally supplied by ../Unified-Debugging.
+# Install its requirements first so this framework uses the exact same loader,
+# validation adapter, and evaluation implementation.
+-r ../Unified-Debugging/requirements.txt
+setuptools>=68
+wheel>=0.41
+python-Levenshtein>=0.25

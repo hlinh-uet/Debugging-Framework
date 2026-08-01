@@ -1,0 +1,2 @@
+"""Patch validation adapters."""
+

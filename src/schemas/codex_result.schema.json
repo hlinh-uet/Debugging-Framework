@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "summary": {
+      "type": "string"
+    },
+    "fault_localization": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "function": { "type": "string" },
+          "score": { "type": "number", "minimum": 0, "maximum": 1 },
+          "reason": { "type": "string" }
+        },
+        "required": ["path", "function", "score", "reason"],
+        "additionalProperties": false
+      }
+    },
+    "repair": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string" },
+        "description": { "type": "string" },
+        "diff": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^--- a/[^\\n]+\\n\\+\\+\\+ b/[^\\n]+\\n"
+        }
+      },
+      "required": ["path", "description", "diff"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["summary", "fault_localization", "repair"],
+  "additionalProperties": false
+}

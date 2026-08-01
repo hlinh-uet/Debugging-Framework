@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel>=0.41"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "debugging-framework"
+version = "0.1.0"
+description = "Defects4C fault localization and repair driven by Codex CLI"
+requires-python = ">=3.10"
+
+[project.scripts]
+debugging-framework = "src.cli:main"
+
+[tool.setuptools.package-data]
+src = ["schemas/*.json"]
+
+[tool.setuptools]
+packages = [
+  "src",
+  "src.core",
+  "src.evaluation",
+  "src.loaders",
+  "src.utils",
+  "src.validation",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
