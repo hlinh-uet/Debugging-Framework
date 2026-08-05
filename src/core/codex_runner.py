@@ -71,6 +71,10 @@ class CodexRunner:
             str(self.schema_path),
             "--output-last-message",
             str(response_path),
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "sandbox_workspace_write.network_access=true",
         ]
         if not self.inherit_user_config:
             command.extend(["--ignore-user-config", "--ignore-rules"])

@@ -8,7 +8,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from src.core.pipeline import DebuggingPipeline, PipelineOptions
+from src.core.pipeline import (
+    DebuggingPipeline,
+    PipelineOptions,
+    classify_validation_result,
+)
 from src.loaders.project import ProjectLoader
 from src.utils.config import FrameworkConfig, Settings
 from src.utils.jsonio import atomic_write_json, atomic_write_text, safe_name
@@ -26,11 +30,15 @@ def build_parser(config: FrameworkConfig | None = None) -> argparse.ArgumentPars
     parser.add_argument("--codex-bin", default=config.codex_executable)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    inspect_parser = sub.add_parser("inspect", help="Tự nhận diện build/test plan, chưa chạy lệnh.")
+    inspect_parser = sub.add_parser(
+        "inspect", help="Tự nhận diện provisioning/build/test plan, chưa chạy lệnh."
+    )
     inspect_parser.add_argument("project", type=Path)
     inspect_parser.add_argument("--json", action="store_true")
 
-    run_parser = sub.add_parser("run", help="Project -> raw patch + validation result.")
+    run_parser = sub.add_parser(
+        "run", help="Project -> Codex FL/APR -> raw patch -> validation result."
+    )
     run_parser.add_argument("project", type=Path, help="Đường dẫn trực tiếp tới project root.")
     run_parser.add_argument("--output", type=Path, help="File patch output.")
     add_run_options(run_parser, config)
@@ -51,7 +59,9 @@ def build_parser(config: FrameworkConfig | None = None) -> argparse.ArgumentPars
     validate_parser.add_argument("--command-timeout", type=int, default=config.command_timeout_seconds)
     validate_parser.add_argument("--jobs", type=int, default=config.jobs)
 
-    doctor_parser = sub.add_parser("doctor", help="Kiểm tra Codex và build/test auto-detection.")
+    doctor_parser = sub.add_parser(
+        "doctor", help="Kiểm tra Codex và provisioning/build/test auto-detection."
+    )
     doctor_parser.add_argument("project", type=Path)
     doctor_parser.add_argument("--jobs", type=int, default=config.jobs)
     return parser
@@ -63,10 +73,6 @@ def add_run_options(parser: argparse.ArgumentParser, config: FrameworkConfig) ->
     parser.add_argument("--codex-timeout", type=int, default=config.codex_timeout_seconds)
     parser.add_argument("--command-timeout", type=int, default=config.command_timeout_seconds)
     parser.add_argument("--jobs", type=int, default=config.jobs)
-    parser.add_argument(
-        "--allow-clean-project", action="store_true",
-        help="Cho phép đề xuất patch dù baseline test đã pass (không khuyến nghị).",
-    )
     parser.add_argument(
         "--inherit-codex-config", action=argparse.BooleanOptionalAction,
         default=config.inherit_codex_config,
@@ -141,7 +147,6 @@ def run_one_project(settings: Settings, project, args, output_patch: Path | None
             attempts=args.attempts,
             model=args.model,
             codex_timeout_seconds=args.codex_timeout,
-            allow_clean_project=args.allow_clean_project,
             inherit_codex_config=args.inherit_codex_config,
         ),
         output_patch=output_patch,
@@ -174,6 +179,13 @@ def run_batch(settings: Settings, config: FrameworkConfig, args) -> int:
         "manifest": str(args.manifest.expanduser().resolve()),
         "project_count": len(results),
         "plausible_count": sum(item["status"] == "plausible" for item in results),
+        "outcome_counts": {
+            outcome: sum(item["status"] == outcome for item in results)
+            for outcome in (
+                "plausible", "cleanfix", "noisefix", "nonefix", "negfix", "invalid",
+                "llm_failed",
+            )
+        },
         "results": results,
     }
     settings.results_dir.mkdir(parents=True, exist_ok=True)
@@ -221,16 +233,17 @@ def validate_patch(settings: Settings, project, patch_path: Path, timeout: int, 
     validator = ProjectValidator(command_timeout=timeout, jobs=jobs)
     baseline = validator.baseline(project, artifact_dir / "baseline")
     if baseline.get("status") == "invalid":
-        result = {"status": "invalid", "baseline": baseline, "validation_error": "baseline_invalid"}
+        patched = validator.invalid_snapshot("baseline_invalid", baseline)
     else:
-        result = validator.validate_diff(
+        patched = validator.validate_diff(
             project=project,
             diff=diff,
             patch_paths=patch_paths,
             artifact_dir=artifact_dir / "patched-validation",
             expected_sha256s=baseline_hashes,
         )
-        result["baseline"] = baseline
+    result = classify_validation_result(baseline, patched)
+    result["baseline"] = baseline
     atomic_write_json(artifact_dir / "result.json", result)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result.get("status") == "plausible" else 1
@@ -265,6 +278,11 @@ def doctor(settings: Settings, project, jobs: int) -> int:
                 exists = local_binary.is_file() and os.access(local_binary, os.X_OK)
             else:
                 exists = shutil.which(binary)
+            generated_by_setup = (
+                bool(plan.setup)
+                and not Path(binary).is_absolute()
+                and ".debugging-framework" in Path(binary).parts
+            )
             if exists:
                 probe_error = _doctor_probe_error(command.argv)
                 if probe_error:
@@ -272,6 +290,10 @@ def doctor(settings: Settings, project, jobs: int) -> int:
                     print(f"[FAIL] {command.label}: {probe_error}")
                 else:
                     print(f"[OK] {command.label}: {' '.join(command.argv)}")
+            elif generated_by_setup:
+                print(
+                    f"[AUTO] {command.label}: {binary} sẽ được tạo bởi provisioning"
+                )
             else:
                 failures += 1
                 print(f"[FAIL] Thiếu executable cho {command.label}: {binary}")

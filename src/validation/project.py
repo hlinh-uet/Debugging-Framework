@@ -158,21 +158,23 @@ class BuildDetector:
                 (CommandSpec("meson-test", ("meson", "test", "-C", build_dir, "--print-errorlogs")),),
             )
         if (root / "Cargo.toml").is_file():
+            fetch = ("cargo", "fetch", "--locked") if (root / "Cargo.lock").is_file() else ("cargo", "fetch")
             return BuildPlan(
-                "cargo", (),
+                "cargo", (CommandSpec("cargo-fetch", fetch),),
                 (CommandSpec("cargo-build", ("cargo", "build", "--all-targets")),),
                 (CommandSpec("cargo-test", ("cargo", "test", "--all-targets")),),
             )
         if (root / "go.mod").is_file():
             return BuildPlan(
-                "go", (),
+                "go", (CommandSpec("go-mod-download", ("go", "mod", "download")),),
                 (CommandSpec("go-build", ("go", "build", "./...")),),
                 (CommandSpec("go-test", ("go", "test", "./...")),),
             )
         if (root / "pom.xml").is_file():
             mvn = "./mvnw" if (root / "mvnw").is_file() else "mvn"
             return BuildPlan(
-                "maven", (),
+                "maven",
+                (CommandSpec("maven-resolve", (mvn, "-q", "-DskipTests", "dependency:go-offline")),),
                 (CommandSpec("maven-build", (mvn, "-q", "-DskipTests", "package")),),
                 (CommandSpec("maven-test", (mvn, "-q", "test")),),
             )
@@ -185,26 +187,37 @@ class BuildDetector:
             )
         if (root / "package.json").is_file():
             return self._node(root)
-        if any((root / name).is_file() for name in ("pyproject.toml", "pytest.ini", "setup.cfg", "setup.py")):
-            python = self._project_python(root)
-            return BuildPlan(
-                "python", (), (),
-                (CommandSpec("pytest", (python, "-m", "pytest", "-q")),),
+        if any(
+            (root / name).is_file()
+            for name in (
+                "pyproject.toml", "pytest.ini", "setup.cfg", "setup.py",
+                "requirements.txt", "requirements-dev.txt", "requirements-test.txt",
             )
+        ):
+            return self._python(root)
         if (root / "Package.swift").is_file():
             return BuildPlan(
-                "swift", (),
+                "swift", (CommandSpec("swift-resolve", ("swift", "package", "resolve")),),
                 (CommandSpec("swift-build", ("swift", "build")),),
                 (CommandSpec("swift-test", ("swift", "test")),),
             )
         if (root / "Gemfile").is_file():
             return BuildPlan(
-                "ruby", (), (),
+                "ruby",
+                (CommandSpec("bundle-install", ("bundle", "install")),),
+                (),
                 (CommandSpec("ruby-test", ("bundle", "exec", "rake", "test")),),
             )
         if (root / "composer.json").is_file():
             return BuildPlan(
-                "composer", (), (),
+                "composer",
+                (
+                    CommandSpec(
+                        "composer-install",
+                        ("composer", "install", "--no-interaction", "--prefer-dist"),
+                    ),
+                ),
+                (),
                 (CommandSpec("composer-test", ("composer", "test")),),
             )
         if (root / "WORKSPACE").is_file() or (root / "MODULE.bazel").is_file():
@@ -216,8 +229,8 @@ class BuildDetector:
         if dotnet:
             target = dotnet[0].name
             return BuildPlan(
-                "dotnet", (),
-                (CommandSpec("dotnet-build", ("dotnet", "build", target)),),
+                "dotnet", (CommandSpec("dotnet-restore", ("dotnet", "restore", target)),),
+                (CommandSpec("dotnet-build", ("dotnet", "build", target, "--no-restore")),),
                 (CommandSpec("dotnet-test", ("dotnet", "test", target, "--no-build")),),
             )
         make = self._make(root)
@@ -398,19 +411,86 @@ class BuildDetector:
             manager = "pnpm"
         elif (root / "yarn.lock").is_file():
             manager = "yarn"
+        elif isinstance(package, dict):
+            declared = str(package.get("packageManager") or "").split("@", 1)[0]
+            if declared in {"npm", "pnpm", "yarn"}:
+                manager = declared
+        if manager == "pnpm":
+            install = (
+                ("pnpm", "install", "--frozen-lockfile")
+                if (root / "pnpm-lock.yaml").is_file()
+                else ("pnpm", "install")
+            )
+        elif manager == "yarn":
+            install = (
+                ("yarn", "install", "--frozen-lockfile")
+                if (root / "yarn.lock").is_file()
+                else ("yarn", "install")
+            )
+        elif (root / "package-lock.json").is_file() or (root / "npm-shrinkwrap.json").is_file():
+            install = ("npm", "ci")
+        else:
+            install = ("npm", "install")
         build = ()
         if "build" in scripts:
             build = (CommandSpec("node-build", (manager, "run", "build")),)
         if "test" not in scripts:
             raise ValueError("package.json không có scripts.test để validation tự động")
-        return BuildPlan("node", (), build, (CommandSpec("node-test", (manager, "test")),))
+        return BuildPlan(
+            "node",
+            (CommandSpec("node-install", install),),
+            build,
+            (CommandSpec("node-test", (manager, "test")),),
+        )
 
     @staticmethod
-    def _project_python(root: Path) -> str:
-        for candidate in (root / ".venv" / "bin" / "python", root / "venv" / "bin" / "python"):
-            if candidate.is_file():
-                return str(candidate)
-        return sys.executable
+    def _python(root: Path) -> BuildPlan:
+        environment = ".debugging-framework/venv"
+        python = f"{environment}/bin/python"
+        requirements = [
+            name
+            for name in (
+                "requirements.txt", "requirements-dev.txt", "requirements-test.txt",
+                "dev-requirements.txt", "requirements/dev.txt", "requirements/test.txt",
+            )
+            if (root / name).is_file()
+        ]
+        install_args: list[str] = [python, "-m", "pip", "install", "--disable-pip-version-check"]
+        for requirement in requirements:
+            install_args.extend(("-r", requirement))
+        if BuildDetector._python_is_installable(root):
+            install_args.extend(("-e", ".[test]"))
+        install_args.append("pytest")
+        return BuildPlan(
+            "python",
+            (
+                CommandSpec("python-venv", (sys.executable, "-m", "venv", environment)),
+                CommandSpec("python-install", tuple(install_args)),
+            ),
+            (),
+            (CommandSpec("pytest", (python, "-m", "pytest", "-q")),),
+        )
+
+    @staticmethod
+    def _python_is_installable(root: Path) -> bool:
+        if (root / "setup.py").is_file():
+            return True
+        setup_cfg = root / "setup.cfg"
+        if setup_cfg.is_file() and re.search(
+            r"(?m)^\s*\[(?:metadata|options)\]\s*(?:#.*)?$",
+            setup_cfg.read_text(encoding="utf-8", errors="replace"),
+        ):
+            return True
+        pyproject = root / "pyproject.toml"
+        if not pyproject.is_file():
+            return False
+        text = pyproject.read_text(encoding="utf-8", errors="replace")
+        return bool(
+            re.search(
+                r"(?m)^\s*\[(?:build-system|project|tool\.(?:poetry|pdm|hatch))\]\s*(?:#.*)?$",
+                text,
+            )
+        )
 
 
 class ProjectValidator:
@@ -500,6 +580,11 @@ class ProjectValidator:
             "baseline_status": str((baseline or {}).get("status") or "unknown"),
             "build_system": str((baseline or {}).get("build_system") or ""),
             "tests_executed": False,
+            "failed_test_ids": [],
+            "passed_test_ids": [],
+            "test_id_granularity": "none",
+            "environment_provisioned": False,
+            "setup_executed": False,
             "validation_workspace_isolated": True,
             "validation_process_sandboxed": bool(self.sandbox_executable),
             "input_project_untouched": True,
@@ -522,10 +607,22 @@ class ProjectValidator:
         build = self._run_commands(root, plan.build, artifact_dir, f"{prefix}-build")
         if not all(item.ok for item in build):
             return self._snapshot(plan, setup, build, [], "invalid", "build_failed")
+        reports_before = self._test_report_state(root)
         tests = self._run_commands(root, plan.test, artifact_dir, f"{prefix}-test")
         if not tests:
             return self._snapshot(plan, setup, build, tests, "invalid", "no_test_command")
-        report_summary = self._structured_test_summary(root) if len(plan.test) == 1 else None
+        report_summary = (
+            self._structured_test_summary(root, reports_before)
+            if len(plan.test) == 1 else None
+        )
+        test_case_results = self._test_case_results(root, reports_before, tests)
+
+        def snapshot(status: str, error: str) -> dict:
+            return self._snapshot(
+                plan, setup, build, tests, status, error,
+                test_case_results=test_case_results,
+            )
+
         report_count = report_summary[0] if report_summary is not None else None
         report_failures = report_summary[1] if report_summary is not None else None
         no_test_outputs = [
@@ -535,16 +632,16 @@ class ProjectValidator:
         if no_test_outputs and (
             (len(tests) == 1 and no_test_outputs[0]) or all(no_test_outputs)
         ) or report_count == 0:
-            return self._snapshot(plan, setup, build, tests, "invalid", "no_tests_discovered")
+            return snapshot("invalid", "no_tests_discovered")
         if any(item.timed_out for item in tests):
-            return self._snapshot(plan, setup, build, tests, "invalid", "test_timeout")
+            return snapshot("invalid", "test_timeout")
         if any(
             item.returncode == 127
             or "No module named pytest" in item.output
             or "command not found" in item.output.lower()
             for item in tests
         ):
-            return self._snapshot(plan, setup, build, tests, "invalid", "test_runner_unavailable")
+            return snapshot("invalid", "test_runner_unavailable")
         unverified = [
             result.label
             for spec, result in zip(plan.test, tests)
@@ -553,10 +650,7 @@ class ProjectValidator:
             )
         ]
         if unverified:
-            return self._snapshot(
-                plan, setup, build, tests, "invalid",
-                "test_execution_unverified:" + ",".join(unverified),
-            )
+            return snapshot("invalid", "test_execution_unverified:" + ",".join(unverified))
         output_failure = [
             bool(
                 (report_failures is not None and report_failures > 0)
@@ -570,23 +664,17 @@ class ProjectValidator:
             if result.ok and reports_failure
         ]
         if conflicts:
-            return self._snapshot(
-                plan, setup, build, tests, "invalid",
-                "test_status_output_conflict:" + ",".join(conflicts),
-            )
+            return snapshot("invalid", "test_status_output_conflict:" + ",".join(conflicts))
         unverified_failures = [
             result.label
             for result, reports_failure in zip(tests, output_failure)
             if not result.ok and not reports_failure
         ]
         if unverified_failures:
-            return self._snapshot(
-                plan, setup, build, tests, "invalid",
-                "test_failure_unverified:" + ",".join(unverified_failures),
-            )
+            return snapshot("invalid", "test_failure_unverified:" + ",".join(unverified_failures))
         tests_ok = all(item.ok for item in tests)
         status = "plausible" if tests_ok else "failing"
-        return self._snapshot(plan, setup, build, tests, status, "")
+        return snapshot(status, "")
 
     @staticmethod
     def _has_test_execution_evidence(
@@ -610,7 +698,7 @@ class ProjectValidator:
         return any(pattern.search(result.output) for pattern in TEST_FAILURE_PATTERNS)
 
     @staticmethod
-    def _structured_test_summary(root: Path) -> tuple[int, int] | None:
+    def _test_report_paths(root: Path) -> set[Path]:
         candidates: set[Path] = set()
         for pattern in (
             "**/surefire-reports/TEST-*.xml",
@@ -620,6 +708,38 @@ class ProjectValidator:
             ".debugging-framework/*.xml",
         ):
             candidates.update(path for path in root.glob(pattern) if path.is_file())
+        return candidates
+
+    @classmethod
+    def _test_report_state(cls, root: Path) -> dict[Path, tuple[int, int]]:
+        state: dict[Path, tuple[int, int]] = {}
+        for path in cls._test_report_paths(root):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            state[path] = (stat.st_mtime_ns, stat.st_size)
+        return state
+
+    @classmethod
+    def _changed_test_reports(
+        cls, root: Path, before: dict[Path, tuple[int, int]]
+    ) -> set[Path]:
+        changed = set()
+        for path in cls._test_report_paths(root):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if before.get(path) != (stat.st_mtime_ns, stat.st_size):
+                changed.add(path)
+        return changed
+
+    @classmethod
+    def _structured_test_summary(
+        cls, root: Path, before: dict[Path, tuple[int, int]] | None = None
+    ) -> tuple[int, int] | None:
+        candidates = cls._changed_test_reports(root, before or {})
         if not candidates:
             return None
         total = 0
@@ -667,6 +787,88 @@ class ProjectValidator:
                         failures += 1
         return (total, failures) if parsed else None
 
+    @classmethod
+    def _test_case_results(
+        cls,
+        root: Path,
+        before: dict[Path, tuple[int, int]],
+        commands: list[CommandResult],
+    ) -> dict[str, bool]:
+        cases: dict[str, bool] = {}
+        for path in cls._changed_test_reports(root, before):
+            try:
+                document = ET.parse(path).getroot()
+            except (ET.ParseError, OSError):
+                continue
+            for node in document.iter():
+                local_name = node.tag.rsplit("}", 1)[-1]
+                if local_name == "testcase":
+                    name = str(node.attrib.get("name") or "").strip()
+                    scope = str(
+                        node.attrib.get("classname") or node.attrib.get("file") or ""
+                    ).strip()
+                    test_id = f"{scope}::{name}" if scope and name else name
+                    if not test_id or any(
+                        child.tag.rsplit("}", 1)[-1] == "skipped" for child in node
+                    ):
+                        continue
+                    passed = not any(
+                        child.tag.rsplit("}", 1)[-1] in {"failure", "error"}
+                        for child in node
+                    )
+                    cases[test_id] = cases.get(test_id, True) and passed
+                elif local_name == "UnitTestResult":
+                    test_id = str(
+                        node.attrib.get("testName") or node.attrib.get("testId") or ""
+                    ).strip()
+                    outcome = str(node.attrib.get("outcome") or "").strip().lower()
+                    if test_id and outcome:
+                        cases[test_id] = cases.get(test_id, True) and outcome in {
+                            "passed", "completed"
+                        }
+
+        output_ids_found = False
+        for command in commands:
+            extracted = cls._failed_test_ids_from_output(command.output)
+            if extracted:
+                output_ids_found = True
+                for test_id in extracted:
+                    cases[test_id] = False
+        if not any(not passed for passed in cases.values()) and not output_ids_found:
+            for command in commands:
+                if not command.ok:
+                    cases[f"command:{command.label}"] = False
+        return cases
+
+    @staticmethod
+    def _failed_test_ids_from_output(output: str) -> set[str]:
+        failed: set[str] = set()
+        patterns = (
+            r"(?m)^FAILED\s+([^\s]+)",
+            r"(?m)^test\s+(.+?)\s+\.\.\.\s+FAILED\s*$",
+            r"(?m)^\s*\d+/\d+\s+Test\s+#\d+:\s+(.+?)\s+\.{2,}\*{3}Failed",
+        )
+        for pattern in patterns:
+            failed.update(
+                match.strip() for match in re.findall(pattern, output) if match.strip()
+            )
+        for line in output.splitlines():
+            if not line.lstrip().startswith("{"):
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(event, dict)
+                and event.get("Action") == "fail"
+                and str(event.get("Test") or "").strip()
+            ):
+                package = str(event.get("Package") or "").strip()
+                name = str(event["Test"]).strip()
+                failed.add(f"{package}::{name}" if package else name)
+        return failed
+
     def _snapshot(
         self,
         plan: BuildPlan,
@@ -675,11 +877,15 @@ class ProjectValidator:
         tests: list[CommandResult],
         status: str,
         error: str,
+        test_case_results: dict[str, bool] | None = None,
     ) -> dict:
+        test_case_results = test_case_results or {}
         return {
             "status": status,
             "validation_error": error,
             "validation_executed": bool(setup or build or tests),
+            "setup_executed": bool(setup),
+            "environment_provisioned": all(item.ok for item in setup),
             "compile_executed": bool(build),
             "tests_executed": bool(tests),
             "build_system": plan.system,
@@ -689,6 +895,19 @@ class ProjectValidator:
             "test_commands": [item.as_dict() for item in tests],
             "post_passed_tests": [item.label for item in tests if item.ok],
             "post_failed_tests": [item.label for item in tests if not item.ok],
+            "failed_test_ids": sorted(
+                test_id for test_id, passed in test_case_results.items() if not passed
+            ),
+            "passed_test_ids": sorted(
+                test_id for test_id, passed in test_case_results.items() if passed
+            ),
+            "test_id_granularity": (
+                "test-case"
+                if any(not test_id.startswith("command:") for test_id in test_case_results)
+                else "command"
+                if test_case_results
+                else "none"
+            ),
             "failure_output": "\n\n".join(item.output[-20_000:] for item in tests if not item.ok),
             "validation_process_sandboxed": True,
         }
@@ -773,6 +992,32 @@ class ProjectValidator:
         for part in root.relative_to(Path("/tmp")).parts:
             current /= part
             destination_dirs.extend(["--dir", str(current)])
+        environment_root = root / ".debugging-framework" / "environment"
+        cache_root = environment_root / "cache"
+        for directory in (
+            cache_root / "pip",
+            cache_root / "npm",
+            cache_root / "yarn",
+            cache_root / "xdg",
+            environment_root / "gradle",
+            environment_root / "cargo",
+            environment_root / "go-mod",
+            environment_root / "go-build",
+            environment_root / "maven",
+            environment_root / "composer",
+            environment_root / "bundle",
+            environment_root / "nuget",
+            environment_root / "dotnet-home",
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+        maven_options = " ".join(
+            value
+            for value in (
+                os.environ.get("MAVEN_OPTS", "").strip(),
+                f"-Dmaven.repo.local={environment_root / 'maven'}",
+            )
+            if value
+        )
         return [
             self.sandbox_executable,
             "--die-with-parent",
@@ -796,6 +1041,48 @@ class ProjectValidator:
             "--setenv",
             "PWD",
             str(cwd),
+            "--setenv",
+            "PIP_CACHE_DIR",
+            str(cache_root / "pip"),
+            "--setenv",
+            "npm_config_cache",
+            str(cache_root / "npm"),
+            "--setenv",
+            "YARN_CACHE_FOLDER",
+            str(cache_root / "yarn"),
+            "--setenv",
+            "XDG_CACHE_HOME",
+            str(cache_root / "xdg"),
+            "--setenv",
+            "GRADLE_USER_HOME",
+            str(environment_root / "gradle"),
+            "--setenv",
+            "CARGO_HOME",
+            str(environment_root / "cargo"),
+            "--setenv",
+            "GOMODCACHE",
+            str(environment_root / "go-mod"),
+            "--setenv",
+            "GOCACHE",
+            str(environment_root / "go-build"),
+            "--setenv",
+            "MAVEN_OPTS",
+            maven_options,
+            "--setenv",
+            "COMPOSER_HOME",
+            str(environment_root / "composer"),
+            "--setenv",
+            "COMPOSER_CACHE_DIR",
+            str(cache_root / "composer"),
+            "--setenv",
+            "BUNDLE_PATH",
+            str(environment_root / "bundle"),
+            "--setenv",
+            "NUGET_PACKAGES",
+            str(environment_root / "nuget"),
+            "--setenv",
+            "DOTNET_CLI_HOME",
+            str(environment_root / "dotnet-home"),
             *argv,
         ]
 

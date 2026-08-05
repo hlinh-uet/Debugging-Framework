@@ -15,16 +15,8 @@ def build_codex_prompt(
     *,
     project_id: str,
     attempt: int,
-    baseline: dict,
     previous_attempt: Optional[dict] = None,
 ) -> str:
-    baseline_context = {
-        "status": baseline.get("status"),
-        "build_system": baseline.get("build_system"),
-        "build_plan": baseline.get("build_plan"),
-        "failed_tests": baseline.get("post_failed_tests", []),
-        "failure_output": _clip(baseline.get("failure_output", ""), 16_000),
-    }
     feedback = ""
     if previous_attempt:
         feedback = (
@@ -34,16 +26,23 @@ def build_codex_prompt(
 
     return f"""You are a software engineer performing fault localization and program repair.
 This is a disposable, writable snapshot of the input project. The framework has already
-run the project's own build and tests. You may edit files and run commands here. The
-framework will extract your patch and independently apply it to a fresh validation copy.
+copied the project here but has not detected, installed, built, or tested it. Take full
+ownership of repository investigation, environment setup, fault localization, and repair.
+The framework will extract your patch and independently validate it on fresh copies.
 
-Investigate the repository structure, production source, tests, build files, callers,
-callees, data flow, error paths, and invariants. Use the failing output below as evidence.
+First inspect repository documentation, manifests, lockfiles, CI configuration, build
+files, and test layout. Determine the project-native setup/build/test workflow, install
+declared dependencies inside this workspace, build it, and reproduce its failing tests.
+Then investigate production source, callers, callees, data flow, error paths, and
+invariants; implement and test the smallest root-cause repair.
 
 Constraints:
-- Do not use internet, git history, hidden accepted fixes, ground truth, or external artifacts.
+- Do not browse for solutions or use git history, hidden accepted fixes, ground truth,
+  or external source artifacts. Network access is only for repository-declared dependency
+  managers and registries needed to set up and test this project.
 - You may change one or more repository files needed for the repair and may run the
-  project's build/tests. Do not install dependencies or write outside this workspace.
+  project's setup/build/tests. You may run repository-declared package-manager setup
+  inside this workspace; never install host/system packages or write outside it.
 - Do not weaken or delete tests merely to make validation pass. Do not include generated
   build output, caches, dependency/vendor trees, or credentials in the repair.
 - Make the smallest root-cause fix that preserves public APIs and project style.
@@ -58,8 +57,6 @@ concrete repository evidence. Include every repaired source location among the h
 Run context:
 {json.dumps({"project_id": project_id, "attempt": attempt}, ensure_ascii=False, indent=2)}
 
-Baseline validation:
-{json.dumps(baseline_context, ensure_ascii=False, indent=2)}
 {feedback}
 
 Inspect the project, implement and test the repair in this temporary workspace, review

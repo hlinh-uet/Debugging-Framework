@@ -112,7 +112,9 @@ class ProjectWorkspace:
         self._run_git("config", "user.name", "Debugging Framework", timeout=30)
         self._run_git("config", "user.email", "debugging-framework@example.invalid", timeout=30)
         (self.path / ".git" / "info" / "exclude").write_text(
-            "node_modules/\n.venv/\nvenv/\ntarget/\nbuild/\ndist/\n.debugging-framework/build/\n",
+            "node_modules/\n.venv/\nvenv/\ntarget/\nbuild/\ndist/\n"
+            ".debugging-framework/build/\n.debugging-framework/environment/\n"
+            ".debugging-framework/venv/\n.debugging-framework/bundle/\n",
             encoding="utf-8",
         )
         files = [
@@ -149,7 +151,7 @@ class ProjectWorkspace:
         elif ".git" in names:
             ignored.add(".git")
         if relative.as_posix() == ".debugging-framework":
-            ignored.add("build")
+            ignored.update({"build", "environment", "venv", "bundle", "cache"})
             ignored.update(
                 name for name in names
                 if Path(name).suffix.lower() in {".log", ".xml", ".status", ".msg"}
@@ -341,7 +343,7 @@ class ValidationWorkspace:
                 if child.is_dir() and (child / "CMakeCache.txt").is_file()
             )
         if relative.as_posix() == ".debugging-framework":
-            ignored.add("build")
+            ignored.update({"build", "environment", "venv", "bundle", "cache"})
             ignored.update(
                 name for name in names
                 if Path(name).suffix.lower() in {".log", ".xml", ".status", ".msg"}

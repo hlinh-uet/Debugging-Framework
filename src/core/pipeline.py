@@ -13,10 +13,12 @@ from src.utils.workspace import ProjectWorkspace, normalize_relpath
 
 STATUS_RANK = {
     "plausible": 0,
-    "failing": 1,
-    "invalid": 2,
-    "llm_failed": 3,
-    "baseline_passed": 4,
+    "cleanfix": 1,
+    "noisefix": 2,
+    "nonefix": 3,
+    "negfix": 4,
+    "invalid": 5,
+    "llm_failed": 6,
 }
 
 
@@ -25,7 +27,6 @@ class PipelineOptions:
     attempts: int = 2
     model: Optional[str] = None
     codex_timeout_seconds: int = 1800
-    allow_clean_project: bool = False
     inherit_codex_config: bool = False
 
 
@@ -50,7 +51,7 @@ class DebuggingPipeline:
 
         manifest = {
             "framework": "debugging-framework-project-repair",
-            "version": 4,
+            "version": 5,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "project": str(project.path),
             "project_id": project.project_id,
@@ -59,39 +60,6 @@ class DebuggingPipeline:
             "output_patch": str(output_patch),
         }
         atomic_write_json(project_results / "run_manifest.json", manifest)
-
-        print(f"[baseline] Tự nhận diện build/test: {project.path}")
-        baseline_dir = project_results / "baseline"
-        try:
-            baseline = self.validator.baseline(project, baseline_dir)
-        except Exception as exc:
-            baseline = self.validator.invalid_snapshot(
-                f"baseline_exception:{type(exc).__name__}:{exc}"
-            )
-        atomic_write_json(baseline_dir / "result.json", baseline)
-
-        if baseline.get("status") == "invalid":
-            result = {
-                "status": "invalid",
-                "validation_error": baseline.get("validation_error", "baseline_invalid"),
-                "project": str(project.path),
-                "output_patch": "",
-                "patch_validation_passed": False,
-                "baseline": baseline,
-                "attempts": [],
-            }
-            return self._finish(project_results, manifest, result)
-        if baseline.get("status") == "plausible" and not options.allow_clean_project:
-            result = {
-                "status": "baseline_passed",
-                "validation_error": "baseline_tests_already_pass",
-                "project": str(project.path),
-                "output_patch": "",
-                "patch_validation_passed": False,
-                "baseline": baseline,
-                "attempts": [],
-            }
-            return self._finish(project_results, manifest, result)
 
         runner = self.runner_factory(
             executable=self.settings.codex_executable,
@@ -110,6 +78,7 @@ class DebuggingPipeline:
         payloads: list[dict] = []
         raw_patches: list[dict] = []
         previous_feedback: dict | None = None
+        baseline: dict | None = None
 
         for attempt_index in range(1, options.attempts + 1):
             print(f"[attempt {attempt_index}/{options.attempts}] Codex đọc project và tạo patch")
@@ -118,12 +87,13 @@ class DebuggingPipeline:
             prompt = build_codex_prompt(
                 project_id=project.project_id,
                 attempt=attempt_index,
-                baseline=baseline,
                 previous_attempt=previous_feedback,
             )
             try:
                 with ProjectWorkspace(project, project_results / "workspaces") as workspace:
                     run = runner.run(workspace=workspace.path, prompt=prompt, artifact_dir=attempt_dir)
+                    payload_artifact = attempt_dir / "codex.payload.json"
+                    atomic_write_json(payload_artifact, run.payload)
                     base_attempt = {
                         "attempt": attempt_index,
                         "codex_ok": run.ok,
@@ -131,6 +101,15 @@ class DebuggingPipeline:
                         "codex_returncode": run.returncode,
                         "elapsed_seconds": round(run.elapsed_seconds, 3),
                         "response": run.payload,
+                        "codex_response_artifact": str(
+                            payload_artifact.relative_to(project_results)
+                        ),
+                        "codex_events_artifact": str(
+                            (attempt_dir / "events.jsonl").relative_to(project_results)
+                        ),
+                        "codex_stderr_artifact": str(
+                            (attempt_dir / "stderr.txt").relative_to(project_results)
+                        ),
                     }
                     raw_diff = str(((run.payload or {}).get("repair") or {}).get("diff") or "")
                     if raw_diff.strip():
@@ -150,7 +129,6 @@ class DebuggingPipeline:
                     payloads.append(run.payload)
 
                     try:
-                        repair = run.payload.get("repair") or {}
                         patch_paths = workspace.unified_diff_paths(raw_diff)
                     except Exception as exc:
                         error = f"codex_diff_parse_failed:{exc}"
@@ -179,22 +157,42 @@ class DebuggingPipeline:
                     diff_path = attempt_dir / "validated.patch.diff"
                     atomic_write_text(diff_path, raw_diff)
 
+                    if baseline is None:
+                        print("[validation] Chạy baseline sạch sau khi Codex đã trả diff")
+                        baseline_dir = project_results / "baseline"
+                        try:
+                            baseline = self.validator.baseline(project, baseline_dir)
+                        except Exception as exc:
+                            baseline = self.validator.invalid_snapshot(
+                                f"baseline_exception:{type(exc).__name__}:{exc}"
+                            )
+                        atomic_write_json(baseline_dir / "result.json", baseline)
+
                     print(
                         f"[attempt {attempt_index}/{options.attempts}] "
-                        f"Build/test patch: {len(patch_paths)} file(s)"
+                        f"Provision/build/test patch: {len(patch_paths)} file(s)"
                     )
-                    try:
-                        snapshot = self.validator.validate_diff(
-                            project=project,
-                            diff=raw_diff,
-                            patch_paths=patch_paths,
-                            artifact_dir=attempt_dir / "validation",
-                            expected_sha256s=baseline_hashes,
-                        )
-                    except Exception as exc:
+                    if baseline.get("status") == "invalid":
                         snapshot = self.validator.invalid_snapshot(
-                            f"validation_exception:{type(exc).__name__}:{exc}", baseline
+                            "baseline_invalid:" + str(
+                                baseline.get("validation_error") or "unknown"
+                            ),
+                            baseline,
                         )
+                    else:
+                        try:
+                            snapshot = self.validator.validate_diff(
+                                project=project,
+                                diff=raw_diff,
+                                patch_paths=patch_paths,
+                                artifact_dir=attempt_dir / "validation",
+                                expected_sha256s=baseline_hashes,
+                            )
+                        except Exception as exc:
+                            snapshot = self.validator.invalid_snapshot(
+                                f"validation_exception:{type(exc).__name__}:{exc}", baseline
+                            )
+                    snapshot = classify_validation_result(baseline, snapshot)
                     candidate = {
                         **base_attempt,
                         **snapshot,
@@ -232,7 +230,10 @@ class DebuggingPipeline:
                         return self._finish(project_results, manifest, result)
                     previous_feedback = {
                         "error": snapshot.get("validation_error") or "tests_still_fail",
-                        "failed_tests": snapshot.get("post_failed_tests", []),
+                        "outcome": snapshot.get("status"),
+                        "failed_tests": snapshot.get("post_failed_test_ids", []),
+                        "fixed_tests": snapshot.get("fixed_test_ids", []),
+                        "regressions": snapshot.get("regression_test_ids", []),
                         "test_output": snapshot.get("failure_output", ""),
                         "previous_patch": raw_diff,
                     }
@@ -265,7 +266,7 @@ class DebuggingPipeline:
                 "output_patch": str(output_patch) if published else "",
                 "llm_patch_artifact": latest["artifact"],
                 "patch_validation_passed": False,
-                "baseline": baseline,
+                "baseline": baseline or {},
                 "attempts": attempts,
                 "fault_localization": self._fault_localization(payloads),
             }
@@ -276,7 +277,7 @@ class DebuggingPipeline:
                 "project": str(project.path),
                 "output_patch": "",
                 "patch_validation_passed": False,
-                "baseline": baseline,
+                "baseline": baseline or {},
                 "attempts": attempts,
                 "fault_localization": self._fault_localization(payloads),
             }
@@ -292,17 +293,26 @@ class DebuggingPipeline:
             "selected_functions": candidate.get("selected_functions", []),
             "patch_diff_artifact": candidate.get("patch_diff_artifact", ""),
             "llm_patch_artifact": candidate.get("llm_patch_artifact", ""),
+            "codex_response_artifact": candidate.get("codex_response_artifact", ""),
+            "codex_events_artifact": candidate.get("codex_events_artifact", ""),
+            "codex_stderr_artifact": candidate.get("codex_stderr_artifact", ""),
             "patch_validation_passed": candidate.get("status") == "plausible",
-            "baseline": baseline,
+            "baseline": baseline or {},
             "validation": {
                 key: value for key, value in candidate.items()
                 if key in {
                     "status", "validation_error", "build_system", "build_plan",
                     "setup_commands", "build_commands", "test_commands",
+                    "setup_executed", "environment_provisioned",
                     "post_passed_tests", "post_failed_tests", "failure_output",
                     "validation_workspace_isolated", "validation_process_sandboxed",
                     "input_project_untouched",
                     "patch_paths",
+                    "post_validation_status", "failed_test_ids",
+                    "initial_failed_test_ids", "post_failed_test_ids",
+                    "fixed_test_ids", "regression_test_ids",
+                    "passed_test_ids", "test_id_granularity",
+                    "classification_basis_valid",
                 }
             },
             "attempts": attempts,
@@ -414,7 +424,7 @@ def select_localizations(payload: dict, relpaths: list[str]) -> list[dict]:
 
 def candidate_sort_key(candidate: dict) -> tuple:
     status = str(candidate.get("status") or "invalid").lower()
-    failed = candidate.get("post_failed_tests")
+    failed = candidate.get("post_failed_test_ids")
     return (
         STATUS_RANK.get(status, 99),
         len(failed) if isinstance(failed, list) else 10**9,
@@ -427,3 +437,73 @@ def public_attempt(candidate: dict) -> dict:
         key: value for key, value in candidate.items()
         if key not in {"patched_function", "patch_diff", "normalized_patch_diff", "response"}
     }
+
+
+def validation_failed_test_ids(snapshot: dict | None) -> list[str]:
+    snapshot = snapshot or {}
+    values = snapshot.get("failed_test_ids")
+    if not isinstance(values, list):
+        values = snapshot.get("post_failed_tests")
+    if not isinstance(values, list):
+        return []
+    return sorted({str(value).strip() for value in values if str(value).strip()})
+
+
+def classify_patch_outcome(baseline: dict | None, patched: dict | None) -> str:
+    """Classify a patch by comparing the same validation scope before and after it."""
+    baseline = baseline or {}
+    patched = patched or {}
+    baseline_status = str(baseline.get("status") or "invalid")
+    patched_status = str(patched.get("status") or "invalid")
+    if baseline_status not in {"plausible", "failing"} or patched_status not in {
+        "plausible", "failing",
+    }:
+        return "invalid"
+    if str(baseline.get("validation_error") or "").strip() or str(
+        patched.get("validation_error") or ""
+    ).strip():
+        return "invalid"
+
+    initial = set(validation_failed_test_ids(baseline))
+    post = set(validation_failed_test_ids(patched))
+    if (baseline_status == "failing") != bool(initial):
+        return "invalid"
+    if (patched_status == "failing") != bool(post):
+        return "invalid"
+    if not post:
+        return "plausible" if initial else "nonefix"
+    fixed = initial - post
+    regressions = post - initial
+    if fixed and regressions:
+        return "noisefix"
+    if fixed:
+        return "cleanfix"
+    if regressions:
+        return "negfix"
+    return "nonefix"
+
+
+def classify_validation_result(baseline: dict | None, patched: dict | None) -> dict:
+    """Attach the public APR outcome and its auditable test-set comparison."""
+    result = dict(patched or {})
+    post_validation_status = str(result.get("status") or "invalid")
+    outcome = classify_patch_outcome(baseline, result)
+    initial = validation_failed_test_ids(baseline)
+    post = validation_failed_test_ids(result)
+    fixed: list[str] = []
+    regressions: list[str] = []
+    if outcome != "invalid":
+        fixed = sorted(set(initial) - set(post))
+        regressions = sorted(set(post) - set(initial))
+    result.update(
+        {
+            "post_validation_status": post_validation_status,
+            "status": outcome,
+            "initial_failed_test_ids": initial,
+            "post_failed_test_ids": post,
+            "fixed_test_ids": fixed,
+            "regression_test_ids": regressions,
+            "classification_basis_valid": outcome != "invalid",
+        }
+    )
+    return result

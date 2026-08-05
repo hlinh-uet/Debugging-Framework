@@ -9,6 +9,11 @@ from typing import Mapping
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
+DEFAULT_RESULTS_DIR = (
+    Path(os.environ["XDG_STATE_HOME"]).expanduser()
+    if os.environ.get("XDG_STATE_HOME")
+    else Path.home() / ".local" / "state"
+) / "debugging-framework" / "results"
 
 # Old keys stay accepted so an existing .env does not prevent the new project-first CLI
 # from starting. They are deliberately not used by the runtime.
@@ -102,7 +107,7 @@ def _path(raw: str, default: Path) -> Path:
 @dataclass(frozen=True)
 class FrameworkConfig:
     env_file: Path = DEFAULT_ENV_FILE
-    results_dir: Path = PROJECT_ROOT / "experiments"
+    results_dir: Path = DEFAULT_RESULTS_DIR
     codex_executable: str = "codex"
     codex_api_key: str = field(default="", repr=False)
     codex_provider: str = ""
@@ -130,7 +135,7 @@ class FrameworkConfig:
         timeout = get("DEBUGGING_TIMEOUT", "1800")
         return cls(
             env_file=path.expanduser().resolve(),
-            results_dir=_path(get("DEBUGGING_RESULTS_DIR"), PROJECT_ROOT / "experiments"),
+            results_dir=_path(get("DEBUGGING_RESULTS_DIR"), DEFAULT_RESULTS_DIR),
             codex_executable=get("DEBUGGING_CODEX_BIN", "codex"),
             codex_api_key=get("CODEX_API_KEY"),
             codex_provider=get("DEBUGGING_CODEX_PROVIDER"),
@@ -153,7 +158,7 @@ class FrameworkConfig:
 
 @dataclass(frozen=True)
 class Settings:
-    results_dir: Path = PROJECT_ROOT / "experiments"
+    results_dir: Path = DEFAULT_RESULTS_DIR
     codex_executable: str = "codex"
     codex_api_key: str = field(default="", repr=False)
     codex_provider: str = ""
