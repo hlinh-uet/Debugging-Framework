@@ -21,19 +21,29 @@ class CodexRunResult:
 
 
 class CodexRunner:
-    """Invoke `codex exec` as a bounded, read-only FL/APR worker."""
+    """Invoke `codex exec` as a bounded worker in a disposable writable copy."""
 
     def __init__(
         self,
         *,
         executable: str,
         schema_path: Path,
+        api_key: str = "",
+        provider: str = "",
+        base_url: str = "",
+        wire_api: str = "responses",
+        env_key: str = "CODEX_API_KEY",
         model: Optional[str] = None,
         timeout_seconds: int = 1800,
         inherit_user_config: bool = False,
     ):
         self.executable = executable
         self.schema_path = schema_path.resolve()
+        self.api_key = api_key
+        self.provider = provider.strip()
+        self.base_url = base_url.strip()
+        self.wire_api = wire_api.strip()
+        self.env_key = env_key.strip() or "CODEX_API_KEY"
         self.model = model
         self.timeout_seconds = timeout_seconds
         self.inherit_user_config = inherit_user_config
@@ -52,7 +62,7 @@ class CodexRunner:
             "--cd",
             str(workspace),
             "--sandbox",
-            "read-only",
+            "workspace-write",
             "--ephemeral",
             "--json",
             "--color",
@@ -64,11 +74,45 @@ class CodexRunner:
         ]
         if not self.inherit_user_config:
             command.extend(["--ignore-user-config", "--ignore-rules"])
+        # Keep the Codex CLI harness and agent loop, while allowing the model
+        # backend to be configured entirely from this project's .env. These
+        # are CLI config overrides, not a direct OpenRouter API call.
+        if self.provider:
+            command.extend(["-c", f"model_provider={_toml_string(self.provider)}"])
+            provider_prefix = f"model_providers.{self.provider}"
+            command.extend(
+                [
+                    "-c",
+                    f"{provider_prefix}.name={_toml_string(self.provider)}",
+                    "-c",
+                    f"{provider_prefix}.env_key={_toml_string(self.env_key)}",
+                ]
+            )
+            if self.base_url:
+                command.extend(
+                    [
+                        "-c",
+                        f"{provider_prefix}.base_url={_toml_string(self.base_url)}",
+                    ]
+                )
+            if self.wire_api:
+                command.extend(
+                    [
+                        "-c",
+                        f"{provider_prefix}.wire_api={_toml_string(self.wire_api)}",
+                    ]
+                )
         if self.model:
             command.extend(["--model", self.model])
         command.append("-")
 
         started = time.monotonic()
+        process_env = os.environ.copy()
+        if self.api_key:
+            # The key is scoped to `codex exec`; never place it in the command
+            # list or any result artifact. The provider's env_key controls the
+            # variable Codex reads (CODEX_API_KEY by default).
+            process_env[self.env_key] = self.api_key
         try:
             process = subprocess.Popen(
                 command,
@@ -79,6 +123,7 @@ class CodexRunner:
                 encoding="utf-8",
                 errors="replace",
                 start_new_session=True,
+                env=process_env,
             )
             try:
                 stdout, stderr = process.communicate(
@@ -152,9 +197,21 @@ def _validate_payload(payload: object) -> str:
         return "codex_response_missing_fault_localization"
     if not isinstance(payload.get("repair"), dict):
         return "codex_response_missing_repair"
+    paths = (payload.get("repair") or {}).get("paths")
+    if (
+        not isinstance(paths, list)
+        or not paths
+        or any(not isinstance(path, str) or not path.strip() for path in paths)
+    ):
+        return "codex_response_missing_repair_paths"
     diff = (payload.get("repair") or {}).get("diff")
     if not isinstance(diff, str) or not diff.strip():
         return "codex_response_missing_repair_diff"
-    if not diff.startswith("--- a/") or "\n+++ b/" not in diff:
+    if not diff.startswith(("--- a/", "diff --git a/")) or "\n+++ b/" not in diff:
         return "codex_response_invalid_repair_diff_format"
     return ""
+
+
+def _toml_string(value: str) -> str:
+    """Encode a small config string safely for Codex's ``-c key=value``."""
+    return json.dumps(value, ensure_ascii=False)

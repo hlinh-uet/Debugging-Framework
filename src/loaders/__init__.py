@@ -1,2 +1,1 @@
-"""Dataset loading adapters."""
-
+"""Direct project loading."""

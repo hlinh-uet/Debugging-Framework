@@ -1,2 +1,1 @@
-"""Patch validation adapters."""
-
+"""Isolated project build and patch validation."""

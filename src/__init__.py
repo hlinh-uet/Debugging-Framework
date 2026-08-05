@@ -1,3 +1,1 @@
-"""Codex-driven fault localization and automated program repair."""
-
-__version__ = "0.1.0"
+"""General project-in, raw-patch-out framework with isolated validation."""

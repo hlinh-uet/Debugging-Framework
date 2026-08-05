@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import difflib
 import hashlib
-import os
 import shutil
 import subprocess
+import tempfile
 import uuid
 from pathlib import Path, PurePosixPath
 
@@ -16,16 +15,21 @@ class WorkspaceError(RuntimeError):
 
 
 SOURCE_EXTENSIONS = {
-    ".c",
-    ".cc",
-    ".cpp",
-    ".cxx",
-    ".h",
-    ".hh",
-    ".hpp",
-    ".hxx",
-    ".inl",
-    ".inc",
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".inc",
+    ".py", ".pyi", ".java", ".kt", ".kts", ".scala", ".go", ".rs", ".swift",
+    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".rb", ".php", ".cs", ".fs",
+    ".ex", ".exs", ".erl", ".hrl", ".lua", ".r", ".dart", ".sh", ".m", ".mm",
+    ".vue", ".svelte", ".sol", ".clj", ".cljs", ".hs", ".lhs",
+}
+
+TEST_PATH_COMPONENTS = {
+    "test", "tests", "testing", "testsuite", "testcases", "spec", "specs",
+    "__tests__", "fixtures", "testdata", "unittest", "unittests", "utest", "utests",
+}
+
+GENERATED_PATH_COMPONENTS = {
+    "build", "dist", "target", "node_modules", ".venv", "venv", "vendor",
+    "generated", ".debugging-framework",
 }
 
 
@@ -37,158 +41,54 @@ def normalize_relpath(value: object) -> str:
     return str(path)
 
 
-def allowed_source_files(raw: dict) -> list[str]:
-    values = raw.get("src_files") if isinstance(raw, dict) else None
-    if not isinstance(values, list) or not values:
-        files = raw.get("files", {}) if isinstance(raw, dict) else {}
-        values = files.get("src") if isinstance(files, dict) else None
-    if not isinstance(values, list) or not values:
-        values = [raw.get("source_relpath")] if isinstance(raw, dict) else []
-    normalized = [normalize_relpath(value) for value in values]
-    return list(dict.fromkeys(value for value in normalized if value))
-
-
-def repair_candidate_files(bug) -> list[str]:
-    """Resolve source candidates from failing-test coverage, never GT fields."""
-    raw = dict(getattr(bug, "raw", None) or {})
-    repository = Path(str(raw.get("buggy_tree_dir") or ""))
-    hints = []
-    for test in getattr(bug, "tests", None) or []:
-        if not isinstance(test, dict):
-            continue
-        if str(test.get("outcome") or "").strip().upper() not in {"FAIL", "FAILED"}:
-            continue
-        coverage = test.get("covered_functions")
-        if not isinstance(coverage, list):
-            coverage = test.get("covered_methods")
-        for key in coverage if isinstance(coverage, list) else []:
-            hint = _coverage_file_hint(key)
-            if hint:
-                hints.append(hint)
-    hints = list(dict.fromkeys(hints))
-    tracked = _tracked_source_files(repository)
-    candidates = []
-    for hint in hints:
-        normalized_hint = hint.replace("\\", "/").lstrip("./")
-        for relpath in tracked:
-            if "/" in normalized_hint:
-                matches = relpath == normalized_hint or relpath.endswith("/" + normalized_hint)
-            else:
-                matches = os.path.basename(relpath) == normalized_hint
-            if matches:
-                candidates.append(relpath)
-    candidates = list(dict.fromkeys(candidates))
-    # Some metadata lacks usable coverage. The loader's source target is then
-    # the only actionable input available, so retain it as an explicit fallback.
-    return candidates or allowed_source_files(raw)
-
-
-def _coverage_file_hint(value: object) -> str:
-    text = str(value or "").strip().replace("\\", "/")
-    lower = text.lower()
-    for extension in sorted(SOURCE_EXTENSIONS, key=len, reverse=True):
-        marker = lower.find(extension)
-        if marker < 0:
-            continue
-        end = marker + len(extension)
-        if end < len(text) and text[end] == ":":
-            return text[:end]
-        if end == len(text):
-            return text
-    return ""
-
-
-def _tracked_source_files(repository: Path) -> list[str]:
-    if not repository.is_dir():
-        return []
-    completed = subprocess.run(
-        ["git", "-C", str(repository), "ls-files", "-z"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        timeout=60,
-        check=False,
+def is_production_source_path(value: object) -> bool:
+    """Accept source files while rejecting tests and generated/build outputs."""
+    relpath = normalize_relpath(value)
+    if not relpath or Path(relpath).suffix.lower() not in SOURCE_EXTENSIONS:
+        return False
+    parts = [part.lower() for part in PurePosixPath(relpath).parts]
+    if any(part in TEST_PATH_COMPONENTS | GENERATED_PATH_COMPONENTS for part in parts[:-1]):
+        return False
+    stem = Path(parts[-1]).stem
+    return not (
+        stem.startswith(("test_", "spec_"))
+        or stem.endswith(("_test", "_tests", "_spec"))
+        or ".test." in parts[-1]
+        or ".spec." in parts[-1]
     )
-    if completed.returncode != 0:
-        return []
-    out = []
-    for item in completed.stdout.split(b"\0"):
-        if not item:
-            continue
-        relpath = normalize_relpath(item.decode("utf-8", errors="replace"))
-        if relpath and Path(relpath).suffix.lower() in SOURCE_EXTENSIONS:
-            out.append(relpath)
-    return out
 
 
-class BugWorkspace:
-    """Disposable worktree containing the benchmark's buggy source overlay."""
+class ProjectWorkspace:
+    """A disposable, history-free snapshot that the repair agent may modify."""
 
-    def __init__(
-        self,
-        bug,
-        worktree_parent: Path,
-        repair_candidates: list[str] | None = None,
-    ):
-        self.bug = bug
-        self.raw = dict(getattr(bug, "raw", None) or {})
-        self.owner_worktree = Path(str(self.raw.get("buggy_tree_dir") or ""))
-        self.commit_after = str(self.raw.get("commit_after") or "").strip()
-        self.commit_before = str(self.raw.get("commit_before") or "").strip()
-        self.overlay_files = allowed_source_files(self.raw)
-        selected_candidates = repair_candidates or repair_candidate_files(bug)
-        self.allowed = list(
-            dict.fromkeys(
-                path for path in (normalize_relpath(item) for item in selected_candidates) if path
+    def __init__(self, project, workspace_parent: Path):
+        self.project = project
+        self.owner = Path(project.path).resolve()
+        self.parent = workspace_parent.resolve()
+        try:
+            self.parent.relative_to(self.owner)
+        except ValueError:
+            pass
+        else:
+            self.parent = (
+                Path(tempfile.gettempdir()).resolve() / "debugging-framework-llm"
             )
-        )
-        self.parent = worktree_parent.resolve()
-        self.path = self.parent / (
-            f"{safe_name(getattr(bug, 'bug_id', 'bug'), 70)}-{uuid.uuid4().hex[:10]}"
-        )
-        self._baseline: dict[str, bytes] = {}
-        self._baseline_cached: set[str] = set()
-        self._owner_git_marker: bytes | None = None
+        self.path = self.parent / f"{safe_name(project.project_id, 70)}-{uuid.uuid4().hex[:10]}"
 
-    def __enter__(self) -> "BugWorkspace":
-        if not self.owner_worktree.is_dir():
-            raise WorkspaceError(f"Buggy worktree không tồn tại: {self.owner_worktree}")
-        if not self.commit_after or not self.commit_before:
-            raise WorkspaceError("Metadata thiếu commit_after/commit_before")
-        if not self.overlay_files:
-            raise WorkspaceError("Metadata không có buggy source overlay")
-        if not self.allowed:
-            raise WorkspaceError("Không resolve được production-source candidate hợp lệ")
-
+    def __enter__(self) -> "ProjectWorkspace":
+        if not self.owner.is_dir():
+            raise WorkspaceError(f"Project không tồn tại: {self.owner}")
         self.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists():
-            raise WorkspaceError(f"Worktree target đã tồn tại: {self.path}")
-        self._run_git(
-            self.owner_worktree,
-            "worktree",
-            "add",
-            "--detach",
-            "--force",
-            str(self.path),
-            self.commit_after,
-            timeout=180,
+            raise WorkspaceError(f"Workspace target đã tồn tại: {self.path}")
+        shutil.copytree(
+            self.owner,
+            self.path,
+            symlinks=True,
+            ignore=self._llm_ignored_paths,
         )
         try:
-            self._run_git(
-                self.path,
-                "checkout",
-                "--force",
-                self.commit_before,
-                "--",
-                *self.overlay_files,
-                timeout=120,
-            )
-            for relpath in self.allowed:
-                source = self.path / relpath
-                if not source.is_file():
-                    raise WorkspaceError(f"Allowed source không tồn tại: {relpath}")
-                self._baseline[relpath] = source.read_bytes()
-            self._isolate_git_history()
-            self._baseline_cached = set(self._git_paths("diff", "--cached", "--name-only"))
+            self._initialize_snapshot_repository()
         except BaseException:
             self.close()
             raise
@@ -198,174 +98,252 @@ class BugWorkspace:
         self.close()
 
     def close(self) -> None:
-        if self.path.exists():
-            self._restore_owner_git_marker()
-            subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(self.owner_worktree),
-                    "worktree",
-                    "remove",
-                    "--force",
-                    str(self.path),
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=120,
-                check=False,
-            )
-        if self.path.exists():
-            resolved = self.path.resolve()
-            if resolved.parent == self.parent and resolved.name.startswith(
-                safe_name(getattr(self.bug, "bug_id", "bug"), 70) + "-"
-            ):
-                shutil.rmtree(resolved)
-
-    def _isolate_git_history(self) -> None:
-        """Replace the linked worktree metadata with a one-commit buggy repo.
-
-        Defects4C's cached worktree has the fixed commit as HEAD and a staged
-        buggy overlay. Exposing that git state would let an agent recover the
-        accepted fix with `git diff --cached`. The Codex-facing repository is
-        therefore reinitialized with only the buggy snapshot in its history.
-        """
-        marker = self.path / ".git"
-        if not marker.is_file() or marker.is_symlink():
-            raise WorkspaceError(f"Git worktree marker không hợp lệ: {marker}")
-        self._owner_git_marker = marker.read_bytes()
-        marker.unlink()
-        try:
-            self._run_git(self.path, "init", timeout=60)
-            self._run_git(self.path, "config", "user.name", "Debugging Framework", timeout=30)
-            self._run_git(
-                self.path,
-                "config",
-                "user.email",
-                "debugging-framework@example.invalid",
-                timeout=30,
-            )
-            self._run_git(self.path, "add", "-A", timeout=120)
-            self._run_git(
-                self.path,
-                "commit",
-                "--no-gpg-sign",
-                "-m",
-                "Buggy benchmark snapshot",
-                timeout=120,
-            )
-        except BaseException:
-            self._restore_owner_git_marker()
-            raise
-
-    def _restore_owner_git_marker(self) -> None:
-        if self._owner_git_marker is None or not self.path.exists():
+        if not self.path.exists():
             return
-        marker = self.path / ".git"
-        if marker.is_dir() and not marker.is_symlink():
-            shutil.rmtree(marker)
-        elif marker.exists() or marker.is_symlink():
-            marker.unlink()
-        marker.write_bytes(self._owner_git_marker)
-        self._owner_git_marker = None
+        resolved = self.path.resolve()
+        if resolved.parent != self.parent or not resolved.name.startswith(
+            safe_name(self.project.project_id, 70) + "-"
+        ):
+            raise WorkspaceError(f"Từ chối xoá workspace path không mong đợi: {resolved}")
+        shutil.rmtree(resolved)
 
-    def changed_source_files(self) -> list[str]:
-        changed = []
-        for relpath, baseline in self._baseline.items():
-            candidate = self.path / relpath
-            if not candidate.is_file() or candidate.read_bytes() != baseline:
-                changed.append(relpath)
-        return changed
+    def _initialize_snapshot_repository(self) -> None:
+        self._run_git("init", timeout=60)
+        self._run_git("config", "user.name", "Debugging Framework", timeout=30)
+        self._run_git("config", "user.email", "debugging-framework@example.invalid", timeout=30)
+        (self.path / ".git" / "info" / "exclude").write_text(
+            "node_modules/\n.venv/\nvenv/\ntarget/\nbuild/\ndist/\n.debugging-framework/build/\n",
+            encoding="utf-8",
+        )
+        files = [
+            path.relative_to(self.path).as_posix()
+            for path in self.path.rglob("*")
+            if path.is_file()
+            and not path.is_symlink()
+            and ".git" not in path.relative_to(self.path).parts
+            and not any(
+                part in {"node_modules", ".venv", "venv", "target", "build", "dist"}
+                for part in path.relative_to(self.path).parts[:-1]
+            )
+        ]
+        if not any(is_production_source_path(path) for path in files):
+            raise WorkspaceError("Project không có production source file được hỗ trợ")
+        for offset in range(0, len(files), 500):
+            self._run_git("add", "-f", "--", *files[offset : offset + 500], timeout=120)
+        self._run_git("commit", "--no-gpg-sign", "-m", "Project snapshot", timeout=180)
 
-    def unexpected_changes(self) -> list[str]:
-        unstaged = set(self._git_paths("diff", "--name-only"))
-        cached = set(self._git_paths("diff", "--cached", "--name-only"))
-        untracked = set(self._git_paths("ls-files", "--others", "--exclude-standard"))
-        newly_cached = cached - self._baseline_cached
-        allowed = set(self.allowed)
-        return sorted((unstaged | newly_cached | untracked) - allowed)
+    def _llm_ignored_paths(self, directory: str, names: list[str]) -> set[str]:
+        current = Path(directory).resolve()
+        try:
+            relative = current.relative_to(self.owner)
+        except ValueError:
+            return set()
+        ignored = {
+            name for name in names
+            if name in {
+                "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+            }
+        }
+        if relative == Path("."):
+            ignored.update(name for name in names if name in {".git", ".env", "build", "dist", "target"})
+        elif ".git" in names:
+            ignored.add(".git")
+        if relative.as_posix() == ".debugging-framework":
+            ignored.add("build")
+            ignored.update(
+                name for name in names
+                if Path(name).suffix.lower() in {".log", ".xml", ".status", ".msg"}
+            )
+        return ignored
 
-    def patched_text(self, relpath: str) -> str:
-        return (self.path / relpath).read_text(encoding="utf-8", errors="replace")
+    def changed_repository_files(self) -> list[str]:
+        return sorted(set(self._git_paths("diff", "--name-only")))
 
-    def apply_unified_diff(self, diff: str) -> None:
-        """Apply Codex's diff; framework, not Codex, mutates this worktree."""
+    def unified_diff_paths(self, diff: str) -> list[str]:
+        return self._unified_diff_paths(str(diff or ""))
+
+    def baseline_sha256s(self, relpaths: list[str]) -> dict[str, str | None]:
+        hashes: dict[str, str | None] = {}
+        for value in relpaths:
+            relpath = normalize_relpath(value)
+            if not relpath:
+                raise WorkspaceError(f"Patch path không an toàn: {value}")
+            completed = subprocess.run(
+                ["git", "-C", str(self.path), "show", f"HEAD:{relpath}"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60, check=False,
+            )
+            hashes[relpath] = (
+                hashlib.sha256(completed.stdout).hexdigest()
+                if completed.returncode == 0 else None
+            )
+        return hashes
+
+    def _unified_diff_paths(self, text: str) -> list[str]:
+        completed = subprocess.run(
+            ["git", "-C", str(self.path), "apply", "--numstat", "-z", "-"],
+            input=text.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=120, check=False,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.decode("utf-8", errors="replace").strip().splitlines()
+            raise WorkspaceError(
+                "codex_diff_parse_failed: " + (detail[-1] if detail else "unknown")
+            )
+        paths = []
+        for record in completed.stdout.split(b"\0"):
+            if not record:
+                continue
+            fields = record.split(b"\t", 2)
+            if len(fields) != 3:
+                raise WorkspaceError("codex_diff_numstat_invalid")
+            relpath = normalize_relpath(fields[2].decode("utf-8", errors="replace"))
+            if not relpath:
+                raise WorkspaceError("codex_diff_contains_unsafe_path")
+            paths.append(relpath)
+        return paths
+
+    def _git_paths(self, *arguments: str) -> list[str]:
+        completed = subprocess.run(
+            ["git", "-C", str(self.path), *arguments, "-z"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.decode(errors="replace").strip()
+            raise WorkspaceError(f"git {' '.join(arguments)} lỗi: {detail}")
+        return [item.decode("utf-8", errors="replace") for item in completed.stdout.split(b"\0") if item]
+
+    def _run_git(self, *arguments: str, timeout: int) -> None:
+        completed = subprocess.run(
+            ["git", "-C", str(self.path), *arguments],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout, check=False,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip().splitlines()
+            raise WorkspaceError(
+                f"git {' '.join(arguments[:3])} lỗi: {detail[-1] if detail else 'unknown'}"
+            )
+
+
+class ValidationWorkspace:
+    """A disposable project copy used for build/test without touching the input."""
+
+    def __init__(self, project):
+        self.project = project
+        self.owner = Path(project.path).resolve()
+        self.parent = Path(tempfile.gettempdir()).resolve() / "debugging-framework-validation"
+        self.path = self.parent / f"{safe_name(project.project_id, 70)}-{uuid.uuid4().hex[:10]}"
+
+    def __enter__(self) -> "ValidationWorkspace":
+        if not self.owner.is_dir():
+            raise WorkspaceError(f"Project không tồn tại: {self.owner}")
+        self.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            raise WorkspaceError(f"Validation workspace đã tồn tại: {self.path}")
+        shutil.copytree(
+            self.owner,
+            self.path,
+            symlinks=True,
+            ignore=self._ignored_paths,
+        )
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if not self.path.exists():
+            return
+        resolved = self.path.resolve()
+        if resolved.parent != self.parent or not resolved.name.startswith(
+            safe_name(self.project.project_id, 70) + "-"
+        ):
+            raise WorkspaceError(f"Từ chối xoá validation workspace: {resolved}")
+        shutil.rmtree(resolved)
+
+    def apply_unified_diff(self, diff: str, expected_paths: list[str] | None = None) -> list[str]:
         text = str(diff or "")
         if not text.strip():
-            raise WorkspaceError("codex_diff_empty")
+            raise WorkspaceError("validation_diff_empty")
+        parsed = subprocess.run(
+            ["git", "-C", str(self.path), "apply", "--numstat", "-z", "-"],
+            input=text.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=120, check=False,
+        )
+        if parsed.returncode != 0:
+            detail = parsed.stderr.decode("utf-8", errors="replace").strip().splitlines()
+            raise WorkspaceError(
+                "validation_diff_parse_failed:" + (detail[-1] if detail else "unknown")
+            )
+        paths = []
+        for record in parsed.stdout.split(b"\0"):
+            if not record:
+                continue
+            fields = record.split(b"\t", 2)
+            relpath = normalize_relpath(
+                fields[2].decode("utf-8", errors="replace") if len(fields) == 3 else ""
+            )
+            if not relpath or PurePosixPath(relpath).parts[0] == ".git":
+                raise WorkspaceError("validation_diff_contains_unsafe_path")
+            candidate = self.path / relpath
+            if candidate.is_symlink():
+                raise WorkspaceError(f"validation_diff_targets_symlink:{relpath}")
+            try:
+                candidate.resolve(strict=False).relative_to(self.path)
+            except ValueError as exc:
+                raise WorkspaceError(f"validation_diff_path_escape:{relpath}") from exc
+            paths.append(relpath)
+        if not paths:
+            raise WorkspaceError("validation_diff_changed_path_count:0")
+        if expected_paths is not None and paths != expected_paths:
+            raise WorkspaceError(
+                "validation_diff_path_mismatch:"
+                + ",".join(expected_paths)
+                + ":"
+                + ",".join(paths)
+            )
         for check in (True, False):
             command = ["git", "-C", str(self.path), "apply", "--whitespace=nowarn"]
             if check:
                 command.append("--check")
             completed = subprocess.run(
-                [*command, "-"],
-                input=text,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=120,
-                check=False,
+                [*command, "-"], input=text, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace", timeout=120, check=False,
             )
             if completed.returncode != 0:
                 detail = (completed.stderr or completed.stdout).strip().splitlines()
                 raise WorkspaceError(
-                    "codex_diff_apply_failed: "
-                    f"{detail[-1] if detail else 'unknown'}"
+                    "validation_diff_apply_failed:"
+                    + (detail[-1] if detail else "unknown")
                 )
+        return paths
 
-    def function_diff(self, relpath: str) -> str:
-        before = self._baseline[relpath].decode("utf-8", errors="replace").splitlines(
-            keepends=True
-        )
-        after = (self.path / relpath).read_text(
-            encoding="utf-8", errors="replace"
-        ).splitlines(keepends=True)
-        return "".join(
-            difflib.unified_diff(
-                before,
-                after,
-                fromfile=f"a/{relpath}",
-                tofile=f"b/{relpath}",
+    def _ignored_paths(self, directory: str, names: list[str]) -> set[str]:
+        current = Path(directory).resolve()
+        try:
+            relative = current.relative_to(self.owner)
+        except ValueError:
+            return set()
+        ignored = {
+            name for name in names
+            if name in {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+        }
+        # A real .git directory is copied so version-derived builds keep working,
+        # but a worktree/submodule .git pointer is excluded because it can write
+        # back into the input repository's administrative directory.
+        if ".git" in names and not (relative == Path(".") and (self.owner / ".git").is_dir()):
+            ignored.add(".git")
+        if relative == Path("."):
+            ignored.update(name for name in names if name in {"build", "dist", "target"})
+            ignored.update(
+                child.name
+                for child in self.owner.iterdir()
+                if child.is_dir() and (child / "CMakeCache.txt").is_file()
             )
-        )
-
-    def baseline_sha256(self, relpath: str) -> str:
-        return hashlib.sha256(self._baseline[relpath]).hexdigest()
-
-    def _git_paths(self, *arguments: str) -> list[str]:
-        completed = subprocess.run(
-            ["git", "-C", str(self.path), *arguments, "-z"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=60,
-            check=False,
-        )
-        if completed.returncode != 0:
-            detail = completed.stderr.decode(errors="replace").strip()
-            raise WorkspaceError(f"git {' '.join(arguments)} lỗi: {detail}")
-        return [
-            item.decode("utf-8", errors="replace")
-            for item in completed.stdout.split(b"\0")
-            if item
-        ]
-
-    @staticmethod
-    def _run_git(cwd: Path, *arguments: str, timeout: int) -> None:
-        completed = subprocess.run(
-            ["git", "-C", str(cwd), *arguments],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            check=False,
-        )
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout).strip().splitlines()
-            raise WorkspaceError(
-                f"git {' '.join(arguments[:3])} lỗi: "
-                f"{detail[-1] if detail else 'unknown'}"
+        if relative.as_posix() == ".debugging-framework":
+            ignored.add("build")
+            ignored.update(
+                name for name in names
+                if Path(name).suffix.lower() in {".log", ".xml", ".status", ".msg"}
             )
+        return ignored

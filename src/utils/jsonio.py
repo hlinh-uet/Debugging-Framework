@@ -7,23 +7,22 @@ from pathlib import Path
 from typing import Any
 
 
-def load_json(path: Path, default: Any) -> Any:
-    try:
-        with path.open("r", encoding="utf-8") as stream:
-            return json.load(stream)
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return default
-
-
 def atomic_write_json(path: Path, value: Any) -> None:
+    atomic_write_text(
+        path,
+        json.dumps(value, indent=2, ensure_ascii=False) + "\n",
+    )
+
+
+def atomic_write_text(path: Path, value: str) -> None:
+    """Atomically replace ``path`` with UTF-8 text on the same filesystem."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(value, stream, indent=2, ensure_ascii=False)
-            stream.write("\n")
+            stream.write(value)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
