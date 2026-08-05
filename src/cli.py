@@ -11,7 +11,6 @@ from pathlib import Path
 from src.core.pipeline import (
     DebuggingPipeline,
     PipelineOptions,
-    classify_validation_result,
 )
 from src.loaders.project import ProjectLoader
 from src.utils.config import FrameworkConfig, Settings
@@ -40,6 +39,10 @@ def build_parser(config: FrameworkConfig | None = None) -> argparse.ArgumentPars
         "run", help="Project -> Codex FL/APR -> raw patch -> validation result."
     )
     run_parser.add_argument("project", type=Path, help="Đường dẫn trực tiếp tới project root.")
+    run_parser.add_argument(
+        "--failing-test", dest="failing_tests", action="append", required=True,
+        help="Tên/ID test đang fail; có thể lặp option cho nhiều test.",
+    )
     run_parser.add_argument("--output", type=Path, help="File patch output.")
     add_run_options(run_parser, config)
 
@@ -50,6 +53,10 @@ def build_parser(config: FrameworkConfig | None = None) -> argparse.ArgumentPars
     batch_parser.add_argument(
         "--output-dir", type=Path,
         help="Thư mục patch output; mặc định dùng results/<project>/patch.diff.",
+    )
+    batch_parser.add_argument(
+        "--failing-test", dest="default_failing_tests", action="append",
+        help="Test fail dùng mặc định cho record không có failing_tests; có thể lặp option.",
     )
     add_run_options(batch_parser, config)
 
@@ -110,7 +117,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "run":
             validate_run_arguments(config, settings, args)
-            result = run_one_project(settings, project, args, args.output)
+            result = run_one_project(
+                settings, project, args, args.output, args.failing_tests
+            )
             print(json.dumps({
                 "status": result.get("status"),
                 "output_patch": result.get("output_patch", ""),
@@ -129,6 +138,19 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
+def normalize_failing_tests(value) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple)):
+        values = list(value)
+    else:
+        raise ValueError("failing_tests phải là chuỗi hoặc danh sách tên test")
+    normalized = tuple(str(item).strip() for item in values if str(item).strip())
+    return normalized
+
+
 def validate_run_arguments(config: FrameworkConfig, settings: Settings, args) -> None:
     if config.require_api_key and not settings.codex_api_key:
         raise ValueError("CODEX_API_KEY chưa được cấu hình")
@@ -136,9 +158,14 @@ def validate_run_arguments(config: FrameworkConfig, settings: Settings, args) ->
         raise ValueError("attempts/timeout phải >= 1")
     if args.jobs < 0:
         raise ValueError("--jobs phải >= 0")
+    if hasattr(args, "failing_tests") and not normalize_failing_tests(args.failing_tests):
+        raise ValueError("cần ít nhất một --failing-test")
 
 
-def run_one_project(settings: Settings, project, args, output_patch: Path | None) -> dict:
+def run_one_project(
+    settings: Settings, project, args, output_patch: Path | None,
+    failing_tests: list[str] | tuple[str, ...] | None = None,
+) -> dict:
     validator = ProjectValidator(command_timeout=args.command_timeout, jobs=args.jobs)
     pipeline = DebuggingPipeline(settings=settings, validator=validator)
     return pipeline.run(
@@ -148,6 +175,7 @@ def run_one_project(settings: Settings, project, args, output_patch: Path | None
             model=args.model,
             codex_timeout_seconds=args.codex_timeout,
             inherit_codex_config=args.inherit_codex_config,
+            failing_tests=tuple(normalize_failing_tests(failing_tests or ())),
         ),
         output_patch=output_patch,
     )
@@ -158,16 +186,25 @@ def run_batch(settings: Settings, config: FrameworkConfig, args) -> int:
     records = load_batch_manifest(args.manifest)
     loader = ProjectLoader()
     output_dir = args.output_dir.expanduser().resolve() if args.output_dir else None
+    default_failing_tests = normalize_failing_tests(
+        getattr(args, "default_failing_tests", None) or ()
+    )
     results = []
     for index, record in enumerate(records, start=1):
         project = loader.load(Path(record["project_path"]))
         print(f"[batch {index}/{len(records)}] {project.path}")
         output = output_dir / f"{safe_name(project.project_id, 180)}.patch" if output_dir else None
-        result = run_one_project(settings, project, args, output)
+        failing_tests = record.get("failing_tests") or default_failing_tests
+        if not failing_tests:
+            raise ValueError(
+                f"Batch record {index} thiếu failing_tests; thêm field này hoặc --failing-test"
+            )
+        result = run_one_project(settings, project, args, output, failing_tests)
         results.append(
             {
                 "project": str(project.path),
                 "bug_id": record.get("bug_id", ""),
+                "failing_tests": failing_tests,
                 "status": result.get("status"),
                 "output_patch": result.get("output_patch", ""),
                 "patch_validation_passed": result.get("patch_validation_passed", False),
@@ -181,10 +218,7 @@ def run_batch(settings: Settings, config: FrameworkConfig, args) -> int:
         "plausible_count": sum(item["status"] == "plausible" for item in results),
         "outcome_counts": {
             outcome: sum(item["status"] == outcome for item in results)
-            for outcome in (
-                "plausible", "cleanfix", "noisefix", "nonefix", "negfix", "invalid",
-                "llm_failed",
-            )
+            for outcome in ("plausible", "failing", "invalid", "llm_failed")
         },
         "results": results,
     }
@@ -212,7 +246,16 @@ def load_batch_manifest(path: Path) -> list[dict]:
         project_path = Path(str(record["project_path"])).expanduser()
         if not project_path.is_absolute():
             project_path = path.parent / project_path
-        normalized.append({**record, "project_path": str(project_path.resolve())})
+        failing_tests = normalize_failing_tests(
+            record.get("failing_tests", record.get("failing_test"))
+        )
+        normalized.append(
+            {
+                **record,
+                "project_path": str(project_path.resolve()),
+                "failing_tests": list(failing_tests),
+            }
+        )
     return normalized
 
 
@@ -229,21 +272,15 @@ def validate_patch(settings: Settings, project, patch_path: Path, timeout: int, 
     atomic_write_text(artifact_dir / "input.patch.diff", diff)
     with ProjectWorkspace(project, artifact_dir / "workspaces") as workspace:
         patch_paths = workspace.unified_diff_paths(diff)
-        baseline_hashes = workspace.baseline_sha256s(patch_paths)
+        snapshot_hashes = workspace.snapshot_sha256s(patch_paths)
     validator = ProjectValidator(command_timeout=timeout, jobs=jobs)
-    baseline = validator.baseline(project, artifact_dir / "baseline")
-    if baseline.get("status") == "invalid":
-        patched = validator.invalid_snapshot("baseline_invalid", baseline)
-    else:
-        patched = validator.validate_diff(
-            project=project,
-            diff=diff,
-            patch_paths=patch_paths,
-            artifact_dir=artifact_dir / "patched-validation",
-            expected_sha256s=baseline_hashes,
-        )
-    result = classify_validation_result(baseline, patched)
-    result["baseline"] = baseline
+    result = validator.validate_diff(
+        project=project,
+        diff=diff,
+        patch_paths=patch_paths,
+        artifact_dir=artifact_dir / "validation",
+        expected_sha256s=snapshot_hashes,
+    )
     atomic_write_json(artifact_dir / "result.json", result)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result.get("status") == "plausible" else 1

@@ -15,8 +15,19 @@ def build_codex_prompt(
     *,
     project_id: str,
     attempt: int,
+    failing_tests: list[str] | tuple[str, ...] | None = None,
     previous_attempt: Optional[dict] = None,
 ) -> str:
+    failing_tests = tuple(
+        str(value).strip() for value in (failing_tests or ()) if str(value).strip()
+    )
+    known_failure = (
+        "The caller has identified these failing test(s). Start by running and "
+        "investigating them; use their failure output as the primary FL/APR signal:\n"
+        + "\n".join(f"- {test}" for test in failing_tests)
+        if failing_tests
+        else "No failing test name was supplied; discover the failing test from the project."
+    )
     feedback = ""
     if previous_attempt:
         feedback = (
@@ -26,13 +37,14 @@ def build_codex_prompt(
 
     return f"""You are a software engineer performing fault localization and program repair.
 This is a disposable, writable snapshot of the input project. The framework has already
-copied the project here but has not detected, installed, built, or tested it. Take full
-ownership of repository investigation, environment setup, fault localization, and repair.
+copied the project here but has not installed, built, or tested it. Take full ownership
+of repository investigation, environment setup, fault localization, and repair.
 The framework will extract your patch and independently validate it on fresh copies.
 
 First inspect repository documentation, manifests, lockfiles, CI configuration, build
 files, and test layout. Determine the project-native setup/build/test workflow, install
 declared dependencies inside this workspace, build it, and reproduce its failing tests.
+{known_failure}
 Then investigate production source, callers, callees, data flow, error paths, and
 invariants; implement and test the smallest root-cause repair.
 

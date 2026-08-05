@@ -164,7 +164,7 @@ class ProjectWorkspace:
     def unified_diff_paths(self, diff: str) -> list[str]:
         return self._unified_diff_paths(str(diff or ""))
 
-    def baseline_sha256s(self, relpaths: list[str]) -> dict[str, str | None]:
+    def snapshot_sha256s(self, relpaths: list[str]) -> dict[str, str | None]:
         hashes: dict[str, str | None] = {}
         for value in relpaths:
             relpath = normalize_relpath(value)

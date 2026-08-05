@@ -15,6 +15,7 @@ from src.core.pipeline import (
     classify_patch_outcome,
     classify_validation_result,
 )
+from src.core.prompts import build_codex_prompt
 from src.loaders.project import ProjectLoader
 from src.utils.config import DEFAULT_RESULTS_DIR, FrameworkConfig
 from src.utils.workspace import ProjectWorkspace, is_production_source_path
@@ -94,6 +95,16 @@ def test_codex_runner_uses_writable_disposable_workspace(tmp_path: Path):
     assert result.command[sandbox_index + 1] == "workspace-write"
     assert "sandbox_workspace_write.network_access=true" in result.command
     assert "approval_policy=\"never\"" in result.command
+
+
+def test_codex_prompt_includes_known_failing_tests():
+    prompt = build_codex_prompt(
+        project_id="sample",
+        attempt=1,
+        failing_tests=("tests/test_api.py::test_retries",),
+    )
+    assert "tests/test_api.py::test_retries" in prompt
+    assert "primary FL/APR signal" in prompt
 
 
 def test_build_detector_uses_project_conventions(tmp_path: Path):
@@ -220,7 +231,7 @@ def test_pipeline_outputs_only_a_validated_patch(tmp_path: Path):
             pass
 
         def run(self, *, workspace, prompt, artifact_dir):
-            assert "has not detected, installed, built, or tested it" in prompt
+            assert "has not installed, built, or tested it" in prompt
             assert not (settings.results_dir / project.project_id / "baseline").exists()
             return CodexRunResult(
                 ok=True,
@@ -273,8 +284,8 @@ def test_pipeline_outputs_only_a_validated_patch(tmp_path: Path):
     )
     assert result["status"] == "plausible"
     assert result["output_patch"] == str(output.resolve())
-    assert result["validation"]["initial_failed_test_ids"] == ["command:test-1"]
-    assert result["validation"]["post_failed_test_ids"] == []
+    assert result["validation"]["failed_test_ids"] == []
+    assert not (settings.results_dir / project.project_id / "baseline").exists()
     payload = (
         settings.results_dir
         / project.project_id
@@ -287,7 +298,7 @@ def test_pipeline_outputs_only_a_validated_patch(tmp_path: Path):
     assert "return 0" in (root / "src" / "value.py").read_text(encoding="utf-8")
 
 
-def test_codex_runs_before_clean_baseline_is_classified_as_nonefix(tmp_path: Path):
+def test_codex_diff_is_validated_without_a_baseline_run(tmp_path: Path):
     root = _custom_project(tmp_path / "clean-project")
     (root / "src" / "value.py").write_text("def value():\n    return 1\n", encoding="utf-8")
     project = ProjectLoader().load(root)
@@ -334,13 +345,92 @@ def test_codex_runs_before_clean_baseline_is_classified_as_nonefix(tmp_path: Pat
         validator=ProjectValidator(command_timeout=30),
         runner_factory=CleanProjectRunner,
     ).run(project, PipelineOptions(attempts=1), output_patch=output)
-    assert result["status"] == "nonefix"
-    assert result["validation"]["fixed_test_ids"] == []
-    assert result["validation"]["regression_test_ids"] == []
+    assert result["status"] == "plausible"
+    assert result["validation"]["failed_test_ids"] == []
+    assert not (settings.results_dir / project.project_id / "baseline").exists()
     assert output.is_file()
 
 
-def test_manual_validate_uses_the_same_public_outcome_classification(tmp_path: Path):
+def test_pipeline_has_one_post_diff_validation_stage(tmp_path: Path):
+    root = _custom_project(tmp_path / "one-stage-project")
+    project = ProjectLoader().load(root)
+    raw_diff = (
+        "--- a/src/value.py\n+++ b/src/value.py\n"
+        "@@ -1,2 +1,2 @@\n def value():\n-    return 0\n+    return 2\n"
+    )
+
+    class OneStageValidator:
+        validate_calls = 0
+
+        def invalid_snapshot(self, error):
+            return {
+                "status": "invalid",
+                "validation_error": error,
+                "failed_test_ids": [],
+            }
+
+        def baseline(self, *_args, **_kwargs):
+            raise AssertionError("the APR pipeline must not run baseline validation")
+
+        def validate_diff(self, **_kwargs):
+            self.validate_calls += 1
+            return {
+                "status": "failing",
+                "validation_error": "",
+                "failed_test_ids": ["test_value"],
+                "passed_test_ids": [],
+                "failure_output": "test_value failed",
+                "validation_workspace_isolated": True,
+                "input_project_untouched": True,
+            }
+
+    class Runner:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run(self, **_kwargs):
+            return CodexRunResult(
+                ok=True,
+                returncode=0,
+                payload={
+                    "summary": "candidate",
+                    "fault_localization": [
+                        {
+                            "path": "src/value.py",
+                            "function": "value",
+                            "score": 1.0,
+                            "reason": "test failure",
+                        }
+                    ],
+                    "repair": {
+                        "paths": ["src/value.py"],
+                        "description": "candidate",
+                        "diff": raw_diff,
+                    },
+                },
+            )
+
+    validator = OneStageValidator()
+    settings = SimpleNamespace(
+        results_dir=tmp_path / "results",
+        codex_executable="fake-codex",
+        output_schema=tmp_path / "schema.json",
+    )
+    output = tmp_path / "one-stage.diff"
+    result = DebuggingPipeline(
+        settings=settings,
+        validator=validator,
+        runner_factory=Runner,
+    ).run(project, PipelineOptions(attempts=1), output_patch=output)
+
+    assert validator.validate_calls == 1
+    assert result["status"] == "failing"
+    assert result["output_patch"] == str(output.resolve())
+    assert output.read_text(encoding="utf-8") == raw_diff
+    assert not (settings.results_dir / project.project_id / "baseline").exists()
+
+
+def test_manual_validate_runs_only_post_diff_validation(tmp_path: Path):
     root = _custom_project(tmp_path / "manual-validate-project")
     original = (root / "src" / "value.py").read_text(encoding="utf-8")
     repaired = original.replace("return 0", "return 1")
@@ -373,9 +463,8 @@ def test_manual_validate_uses_the_same_public_outcome_classification(tmp_path: P
     result = json.loads(result_path.read_text(encoding="utf-8"))
     assert returncode == 0
     assert result["status"] == "plausible"
-    assert result["post_validation_status"] == "plausible"
-    assert result["initial_failed_test_ids"] == ["command:test-1"]
-    assert result["post_failed_test_ids"] == []
+    assert result["failed_test_ids"] == []
+    assert not (settings.results_dir / root.name / "manual-validation" / "baseline").exists()
     assert (root / "src" / "value.py").read_text(encoding="utf-8") == original
 
 
@@ -773,7 +862,7 @@ def test_failed_validation_still_outputs_raw_diff_without_modifying_input(tmp_pa
         runner_factory=FailingPatchRunner,
     ).run(project, PipelineOptions(attempts=1), output_patch=output)
 
-    assert result["status"] == "nonefix"
+    assert result["status"] == "failing"
     assert result["output_patch"] == str(output.resolve())
     assert output.read_text(encoding="utf-8") == raw_diff
     assert (root / "src" / "value.py").read_bytes() == original
@@ -909,14 +998,39 @@ def test_cli_accepts_materialized_batch_manifest(tmp_path: Path):
     assert args.manifest == tmp_path / "versions.json"
 
 
+def test_cli_run_requires_and_collects_failing_test_names(tmp_path: Path):
+    args = build_parser().parse_args(
+        [
+            "run",
+            str(tmp_path / "project"),
+            "--failing-test",
+            "tests/test_api.py::test_retries",
+            "--failing-test",
+            "tests/test_api.py::test_timeout",
+        ]
+    )
+    assert args.failing_tests == [
+        "tests/test_api.py::test_retries",
+        "tests/test_api.py::test_timeout",
+    ]
+
+
 def test_run_batch_processes_each_project_and_writes_summary(tmp_path: Path, monkeypatch):
     manifest = tmp_path / "versions.json"
     manifest.write_text(
         json.dumps(
             {
                 "projects": [
-                    {"bug_id": "A.1", "project_path": "/data/bug-1"},
-                    {"bug_id": "A.2", "project_path": "/data/bug-2"},
+                    {
+                        "bug_id": "A.1",
+                        "project_path": "/data/bug-1",
+                        "failing_tests": ["tests/test_a.py::test_a"],
+                    },
+                    {
+                        "bug_id": "A.2",
+                        "project_path": "/data/bug-2",
+                        "failing_test": "tests/test_b.py::test_b",
+                    },
                 ]
             }
         ),
@@ -927,8 +1041,8 @@ def test_run_batch_processes_each_project_and_writes_summary(tmp_path: Path, mon
     def fake_load(_loader, path):
         return SimpleNamespace(path=path, project_id=path.name)
 
-    def fake_run(_settings, project, _args, output):
-        seen.append((project.project_id, output))
+    def fake_run(_settings, project, _args, output, failing_tests):
+        seen.append((project.project_id, output, failing_tests))
         return {"status": "plausible", "output_patch": str(output)}
 
     monkeypatch.setattr(cli.ProjectLoader, "load", fake_load)
@@ -950,6 +1064,8 @@ def test_run_batch_processes_each_project_and_writes_summary(tmp_path: Path, mon
 
     assert returncode == 0
     assert [item[0] for item in seen] == ["bug-1", "bug-2"]
+    assert seen[0][2] == ["tests/test_a.py::test_a"]
+    assert seen[1][2] == ["tests/test_b.py::test_b"]
     summary = json.loads((settings.results_dir / "batch_result.json").read_text())
     assert summary["project_count"] == 2
     assert summary["plausible_count"] == 2

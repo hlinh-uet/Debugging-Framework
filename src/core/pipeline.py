@@ -13,10 +13,7 @@ from src.utils.workspace import ProjectWorkspace, normalize_relpath
 
 STATUS_RANK = {
     "plausible": 0,
-    "cleanfix": 1,
-    "noisefix": 2,
-    "nonefix": 3,
-    "negfix": 4,
+    "failing": 1,
     "invalid": 5,
     "llm_failed": 6,
 }
@@ -28,6 +25,7 @@ class PipelineOptions:
     model: Optional[str] = None
     codex_timeout_seconds: int = 1800
     inherit_codex_config: bool = False
+    failing_tests: tuple[str, ...] = ()
 
 
 class DebuggingPipeline:
@@ -51,12 +49,13 @@ class DebuggingPipeline:
 
         manifest = {
             "framework": "debugging-framework-project-repair",
-            "version": 5,
+            "version": 6,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "project": str(project.path),
             "project_id": project.project_id,
             "attempts": options.attempts,
             "model": options.model or "codex-cli-default",
+            "failing_tests": list(options.failing_tests),
             "output_patch": str(output_patch),
         }
         atomic_write_json(project_results / "run_manifest.json", manifest)
@@ -78,8 +77,6 @@ class DebuggingPipeline:
         payloads: list[dict] = []
         raw_patches: list[dict] = []
         previous_feedback: dict | None = None
-        baseline: dict | None = None
-
         for attempt_index in range(1, options.attempts + 1):
             print(f"[attempt {attempt_index}/{options.attempts}] Codex đọc project và tạo patch")
             attempt_dir = project_results / "attempts" / f"attempt_{attempt_index:02d}"
@@ -87,6 +84,7 @@ class DebuggingPipeline:
             prompt = build_codex_prompt(
                 project_id=project.project_id,
                 attempt=attempt_index,
+                failing_tests=options.failing_tests,
                 previous_attempt=previous_feedback,
             )
             try:
@@ -133,21 +131,21 @@ class DebuggingPipeline:
                     except Exception as exc:
                         error = f"codex_diff_parse_failed:{exc}"
                         attempts.append(
-                            {**base_attempt, **self.validator.invalid_snapshot(error, baseline)}
+                            {**base_attempt, **self.validator.invalid_snapshot(error)}
                         )
                         previous_feedback = {"error": error}
                         continue
                     policy_error = self._response_path_error(run.payload, patch_paths)
                     if policy_error:
                         attempts.append(
-                            {**base_attempt, **self.validator.invalid_snapshot(policy_error, baseline)}
+                            {**base_attempt, **self.validator.invalid_snapshot(policy_error)}
                         )
                         previous_feedback = {
                             "error": policy_error,
                             "patch_paths": patch_paths,
                         }
                         continue
-                    baseline_hashes = workspace.baseline_sha256s(patch_paths)
+                    snapshot_hashes = workspace.snapshot_sha256s(patch_paths)
                     workspace_changes = workspace.changed_repository_files()
                     localized = select_localizations(run.payload, patch_paths)
                     selected_functions = [
@@ -157,42 +155,22 @@ class DebuggingPipeline:
                     diff_path = attempt_dir / "validated.patch.diff"
                     atomic_write_text(diff_path, raw_diff)
 
-                    if baseline is None:
-                        print("[validation] Chạy baseline sạch sau khi Codex đã trả diff")
-                        baseline_dir = project_results / "baseline"
-                        try:
-                            baseline = self.validator.baseline(project, baseline_dir)
-                        except Exception as exc:
-                            baseline = self.validator.invalid_snapshot(
-                                f"baseline_exception:{type(exc).__name__}:{exc}"
-                            )
-                        atomic_write_json(baseline_dir / "result.json", baseline)
-
                     print(
                         f"[attempt {attempt_index}/{options.attempts}] "
-                        f"Provision/build/test patch: {len(patch_paths)} file(s)"
+                        f"Apply/provision/build/test diff: {len(patch_paths)} file(s)"
                     )
-                    if baseline.get("status") == "invalid":
-                        snapshot = self.validator.invalid_snapshot(
-                            "baseline_invalid:" + str(
-                                baseline.get("validation_error") or "unknown"
-                            ),
-                            baseline,
+                    try:
+                        snapshot = self.validator.validate_diff(
+                            project=project,
+                            diff=raw_diff,
+                            patch_paths=patch_paths,
+                            artifact_dir=attempt_dir / "validation",
+                            expected_sha256s=snapshot_hashes,
                         )
-                    else:
-                        try:
-                            snapshot = self.validator.validate_diff(
-                                project=project,
-                                diff=raw_diff,
-                                patch_paths=patch_paths,
-                                artifact_dir=attempt_dir / "validation",
-                                expected_sha256s=baseline_hashes,
-                            )
-                        except Exception as exc:
-                            snapshot = self.validator.invalid_snapshot(
-                                f"validation_exception:{type(exc).__name__}:{exc}", baseline
-                            )
-                    snapshot = classify_validation_result(baseline, snapshot)
+                    except Exception as exc:
+                        snapshot = self.validator.invalid_snapshot(
+                            f"validation_exception:{type(exc).__name__}:{exc}"
+                        )
                     candidate = {
                         **base_attempt,
                         **snapshot,
@@ -201,7 +179,7 @@ class DebuggingPipeline:
                         "patch_diff": raw_diff,
                         "llm_patch_artifact": base_attempt.get("llm_patch_artifact", ""),
                         "patch_diff_artifact": str(diff_path.relative_to(project_results)),
-                        "baseline_sha256s": baseline_hashes,
+                        "snapshot_sha256s": snapshot_hashes,
                         "workspace_changed_files": workspace_changes[:200],
                         "workspace_changed_file_count": len(workspace_changes),
                         "workspace_changes_not_in_patch": sorted(
@@ -225,15 +203,13 @@ class DebuggingPipeline:
                             previous_feedback = {"error": candidate["validation_error"]}
                             continue
                         result = self._result(
-                            project, baseline, attempts, candidate, output_patch, payloads
+                            project, attempts, candidate, output_patch, payloads
                         )
                         return self._finish(project_results, manifest, result)
                     previous_feedback = {
                         "error": snapshot.get("validation_error") or "tests_still_fail",
                         "outcome": snapshot.get("status"),
-                        "failed_tests": snapshot.get("post_failed_test_ids", []),
-                        "fixed_tests": snapshot.get("fixed_test_ids", []),
-                        "regressions": snapshot.get("regression_test_ids", []),
+                        "failed_tests": snapshot.get("failed_test_ids", []),
                         "test_output": snapshot.get("failure_output", ""),
                         "previous_patch": raw_diff,
                     }
@@ -254,7 +230,7 @@ class DebuggingPipeline:
                     "validation_error": publish_error,
                 }
             result = self._result(
-                project, baseline, attempts, best, output_patch if published else None, payloads
+                project, attempts, best, output_patch if published else None, payloads
             )
         elif raw_patches:
             latest = raw_patches[-1]
@@ -266,7 +242,6 @@ class DebuggingPipeline:
                 "output_patch": str(output_patch) if published else "",
                 "llm_patch_artifact": latest["artifact"],
                 "patch_validation_passed": False,
-                "baseline": baseline or {},
                 "attempts": attempts,
                 "fault_localization": self._fault_localization(payloads),
             }
@@ -277,13 +252,12 @@ class DebuggingPipeline:
                 "project": str(project.path),
                 "output_patch": "",
                 "patch_validation_passed": False,
-                "baseline": baseline or {},
                 "attempts": attempts,
                 "fault_localization": self._fault_localization(payloads),
             }
         return self._finish(project_results, manifest, result)
 
-    def _result(self, project, baseline, attempts, candidate, output_patch, payloads) -> dict:
+    def _result(self, project, attempts, candidate, output_patch, payloads) -> dict:
         return {
             "status": candidate.get("status", "invalid"),
             "validation_error": candidate.get("validation_error", ""),
@@ -297,7 +271,6 @@ class DebuggingPipeline:
             "codex_events_artifact": candidate.get("codex_events_artifact", ""),
             "codex_stderr_artifact": candidate.get("codex_stderr_artifact", ""),
             "patch_validation_passed": candidate.get("status") == "plausible",
-            "baseline": baseline or {},
             "validation": {
                 key: value for key, value in candidate.items()
                 if key in {
@@ -308,11 +281,7 @@ class DebuggingPipeline:
                     "validation_workspace_isolated", "validation_process_sandboxed",
                     "input_project_untouched",
                     "patch_paths",
-                    "post_validation_status", "failed_test_ids",
-                    "initial_failed_test_ids", "post_failed_test_ids",
-                    "fixed_test_ids", "regression_test_ids",
-                    "passed_test_ids", "test_id_granularity",
-                    "classification_basis_valid",
+                    "failed_test_ids", "passed_test_ids", "test_id_granularity",
                 }
             },
             "attempts": attempts,
@@ -424,7 +393,9 @@ def select_localizations(payload: dict, relpaths: list[str]) -> list[dict]:
 
 def candidate_sort_key(candidate: dict) -> tuple:
     status = str(candidate.get("status") or "invalid").lower()
-    failed = candidate.get("post_failed_test_ids")
+    failed = candidate.get("failed_test_ids")
+    if not isinstance(failed, list):
+        failed = candidate.get("post_failed_test_ids")
     return (
         STATUS_RANK.get(status, 99),
         len(failed) if isinstance(failed, list) else 10**9,

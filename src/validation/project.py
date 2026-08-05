@@ -494,7 +494,7 @@ class BuildDetector:
 
 
 class ProjectValidator:
-    """Run baseline and patched validation on the supplied project itself."""
+    """Run isolated validation on a project or an applied diff."""
 
     def __init__(
         self,
@@ -514,6 +514,7 @@ class ProjectValidator:
         return plan
 
     def baseline(self, project: Project, artifact_dir: Path) -> dict:
+        """Run an explicit clean-project diagnostic; the APR pipeline does not call this."""
         self._require_artifacts_outside_input(project, artifact_dir)
         if not self.sandbox_executable:
             return self.invalid_snapshot("validation_sandbox_unavailable:bwrap")
@@ -548,7 +549,7 @@ class ProjectValidator:
         for relpath, expected in (expected_sha256s or {}).items():
             normalized = normalize_relpath(relpath)
             if not normalized or normalized not in normalized_paths:
-                return self.invalid_snapshot("patch_baseline_hash_path_mismatch")
+                return self.invalid_snapshot("patch_snapshot_hash_path_mismatch")
             entry = owner_root / normalized
             if entry.is_symlink():
                 return self.invalid_snapshot(f"patch_targets_symlink:{normalized}")
@@ -573,12 +574,11 @@ class ProjectValidator:
         snapshot["input_project_untouched"] = True
         return snapshot
 
-    def invalid_snapshot(self, error: str, baseline: dict | None = None) -> dict:
+    def invalid_snapshot(self, error: str) -> dict:
         return {
             "status": "invalid",
             "validation_error": error,
-            "baseline_status": str((baseline or {}).get("status") or "unknown"),
-            "build_system": str((baseline or {}).get("build_system") or ""),
+            "build_system": "",
             "tests_executed": False,
             "failed_test_ids": [],
             "passed_test_ids": [],

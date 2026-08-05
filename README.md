@@ -8,10 +8,9 @@ LLM cùng kết quả build/test cách ly**.
   -> tạo snapshot writable cách ly, không có git history thật, cho Codex
   -> Codex tự đọc manifest/CI/docs, cài dependency, build/test, làm FL + APR
   -> lưu nguyên phản hồi Codex và raw unified diff trước khi validation
-  -> pipeline chạy baseline trên một bản sao sạch độc lập
   -> apply toàn bộ diff vào một bản sao validation mới
-  -> tự provision/build/test lại đúng cùng phạm vi
-  -> xuất raw unified diff + plausible/cleanfix/noisefix/nonefix/negfix
+  -> tự provision/build/test lại đúng cùng phạm vi một lần
+  -> xuất raw unified diff + plausible/failing/invalid
 ```
 
 Framework không đọc metadata Defects4C, không cần ground truth, không dùng
@@ -20,11 +19,15 @@ project, và không cần Docker container riêng cho dataset.
 
 ## Input và output
 
-Input là đường dẫn trực tiếp tới project root:
+Input của lệnh `run` gồm project root và ít nhất một tên/ID test đang fail:
 
 ```bash
-python -m src run /home/halinh/Unified_Debugging/defects4c/data/my-project
+python -m src run /home/halinh/Unified_Debugging/defects4c/data/my-project \
+  --failing-test tests/test_api.py::test_retries
 ```
+
+Có thể truyền `--failing-test` nhiều lần khi một bug làm fail nhiều test. Tên/ID
+này được đưa nguyên vào prompt Codex để làm failure signal chính cho FL/APR.
 
 Các thư mục `defectsc_tpl/projects*` không phải source project; chúng là recipe
 chứa nhiều bug/version. Dùng materializer của Defects4C để biến đúng một entry
@@ -60,6 +63,7 @@ Sau đó framework chỉ đọc project đã materialize:
 cd /home/halinh/Unified_Debugging/Debugging-Framework
 python3 -m src run \
   /home/halinh/Unified_Debugging/defects4c/data/CESNET___libyang__A.3__f128972045a5 \
+  --failing-test tests/test_api.py::test_retries \
   --output /tmp/A.3.patch
 ```
 
@@ -71,9 +75,20 @@ python3 -m src run-batch \
   --output-dir /tmp/libyang-patches
 ```
 
-`run-batch` chỉ là vòng lặp qua các `project_path` trong manifest. Với từng path,
-framework vẫn dùng đúng luồng project-in/patch-out như lệnh `run`. Tổng hợp trạng
-thái được ghi tại `<results-dir>/batch_result.json`.
+`run-batch` là vòng lặp qua các record trong manifest. Mỗi record cần có
+`failing_tests` (list) hoặc `failing_test` (string); có thể dùng
+`--failing-test` trên command line làm giá trị mặc định cho record thiếu field.
+Với từng path, framework vẫn dùng đúng luồng project-in/patch-out như lệnh `run`.
+Tổng hợp trạng thái được ghi tại `<results-dir>/batch_result.json`.
+
+Ví dụ record:
+
+```json
+{
+  "project_path": "/path/to/project",
+  "failing_tests": ["tests/test_api.py::test_retries"]
+}
+```
 
 Output mặc định:
 
@@ -101,7 +116,7 @@ nguyên văn tại `attempts/attempt_NN/llm.patch.diff`, kể cả khi diff khô
 hoặc `patch_validation_passed` trong result để biết patch đã qua validation hay
 chưa.
 
-Project đầu vào không bị chép đè: baseline và patched validation đều chạy trên
+Project đầu vào không bị chép đè: Codex và patched validation đều chạy trên
 bản sao tạm; từng lệnh build/test còn chạy trong Bubblewrap với filesystem host
 read-only và chỉ validation snapshot được ghi. Log, response và artifact audit
 nằm trong `<results-dir>/<project-name>/`.
@@ -128,11 +143,11 @@ trên command line.
 
 ## Auto-provisioning, build và test
 
-Lệnh `run` có hai lớp độc lập. Trước hết Codex tự khám phá workflow và tự chạy các
-lệnh cần thiết trong snapshot của nó để FL/APR. Chỉ sau khi raw diff đã được lưu,
-validator mới tự nhận diện một plan xác định từ file chuẩn trong project và chạy
-plan đó trên baseline sạch cùng bản sao đã apply patch. `inspect` và `doctor` chỉ
-là công cụ chẩn đoán validator, không phải bước bắt buộc.
+Lệnh `run` có hai stage. Trước hết Codex tự khám phá workflow và tự chạy các lệnh
+cần thiết trong snapshot của nó để FL/APR. Chỉ sau khi raw diff đã được lưu,
+validator mới tự nhận diện một plan xác định từ file chuẩn trong project, apply
+diff vào một bản sao sạch và chạy plan đó một lần. `inspect` và `doctor` chỉ là
+công cụ chẩn đoán validator, không phải bước bắt buộc.
 
 | Project marker | Provisioning và validation tự động |
 | --- | --- |
@@ -149,12 +164,11 @@ là công cụ chẩn đoán validator, không phải bước bắt buộc.
 | Ruby, Composer | bundle/composer install rồi chạy test |
 | Bazel, Ninja | build/test command chuẩn tương ứng |
 
-Baseline và patched validation đều bắt đầu từ source snapshot sạch và tự
-provision lại. Venv, `node_modules`, vendor tree, package cache và build output
-chỉ tồn tại trong snapshot rồi bị xóa; chúng không được copy về input project và
-không xuất hiện trong patch. Baseline chỉ chạy sau khi Codex đã trả diff và được
-cache để so sánh các attempt tiếp theo, nên lỗi auto-detection không ngăn Codex
-tự điều tra project trước.
+Patched validation bắt đầu từ source snapshot sạch và tự provision lại. Venv,
+`node_modules`, vendor tree, package cache và build output chỉ tồn tại trong
+snapshot rồi bị xóa; chúng không được copy về input project và không xuất hiện
+trong patch. Lỗi auto-detection không ngăn Codex tự điều tra project trước; chỉ
+validation sau khi có diff mới yêu cầu build/test contract hợp lệ.
 
 Với build system nội bộ không theo convention công khai, project có thể tự mô tả
 command bằng `.debugging-framework.json` ở project root. Đây là cấu hình thuộc
@@ -212,7 +226,9 @@ và dừng fail-closed, không giả vờ patch đã pass.
 Vì vậy giao diện cho người dùng cuối vẫn là đúng một lệnh:
 
 ```bash
-debugging-framework run /path/to/project --output /tmp/fix.patch
+debugging-framework run /path/to/project \
+  --failing-test tests/test_api.py::test_retries \
+  --output /tmp/fix.patch
 ```
 
 Việc cài framework/toolchain bên dưới là công việc một lần của người vận hành
@@ -269,12 +285,14 @@ python -m src doctor /path/to/project
 Chạy repair đầy đủ:
 
 ```bash
-debugging-framework run /path/to/project --attempts 2 --output /tmp/fix.patch
+debugging-framework run /path/to/project \
+  --failing-test tests/test_api.py::test_retries \
+  --attempts 2 --output /tmp/fix.patch
 ```
 
 Đây là lệnh duy nhất cần chạy cho mỗi project. Codex tự setup, tái hiện lỗi, làm
-fault localization/APR và trả diff trước; pipeline sau đó tự chạy baseline và
-validation lại patch.
+fault localization/APR và trả diff trước; pipeline sau đó apply diff vào snapshot
+sạch và validation lại patch.
 
 Chạy mọi project đã materialize trong một manifest:
 
@@ -313,12 +331,12 @@ build hoặc test command.
 ## Bảo đảm validation
 
 - Codex luôn chạy trước trên một bản sao tạm; phản hồi JSON và raw diff được lưu
-  trước khi pipeline bắt đầu baseline/patch validation.
-- Baseline và patched validation chạy trong hai bản sao cách ly. Bubblewrap mount
+  trước khi pipeline bắt đầu patch validation.
+- Patched validation chạy trên một bản sao cách ly. Bubblewrap mount
   host read-only và chỉ cho phép ghi vào snapshot tạm, nên input project không bị
   thay source hoặc giữ build artifact của patch.
-- Baseline phải build được và phải có bằng chứng ít nhất một test thực sự chạy.
-- Dependency setup chạy tự động trước cả baseline lẫn patched build/test; kết quả
+- Patched validation phải build được và phải có bằng chứng ít nhất một test thực sự chạy.
+- Dependency setup chạy tự động trước patched build/test; kết quả
   ghi rõ `setup_executed`, `environment_provisioned` và log từng setup command.
 - Build/test plan của patched validation được chốt từ snapshot sạch trước khi
   apply diff; patch không thể thay validation contract để chọn lệnh test dễ hơn.
@@ -334,18 +352,14 @@ build hoặc test command.
   Cargo, CTest, Go. Nếu runner không cung cấp ID test, nó dùng ID cấp command và
   phân loại bảo thủ.
 
-Kết quả APR được tính bằng hiệu giữa tập test fail của baseline và bản đã patch:
+Kết quả validation phản ánh trực tiếp trạng thái của bản đã apply diff:
 
 | `status` | Ý nghĩa |
 | --- | --- |
-| `plausible` | Có lỗi ban đầu và tất cả test đều pass sau patch |
-| `cleanfix` | Sửa được một phần lỗi ban đầu, không tạo regression |
-| `noisefix` | Sửa được lỗi ban đầu nhưng đồng thời tạo regression |
-| `nonefix` | Không sửa lỗi nào và cũng không tạo lỗi mới |
-| `negfix` | Không sửa lỗi ban đầu nào nhưng tạo regression |
+| `plausible` | Diff apply được, build pass và tất cả test đã chạy đều pass |
+| `failing` | Diff apply được nhưng có test fail |
 
 `invalid` được giữ riêng cho lỗi hạ tầng/contract, chẳng hạn không build được,
-không xác minh được test đã chạy hoặc diff không apply được; trạng thái đó không
-được suy diễn thành một trong năm kết quả APR. `result.json` lưu cả
-`initial_failed_test_ids`, `post_failed_test_ids`, `fixed_test_ids`,
-`regression_test_ids` và trạng thái thô `post_validation_status` để audit.
+không xác minh được test đã chạy hoặc diff không apply được. Raw diff vẫn được
+publish trong cả hai trường hợp `failing` và `invalid`; `patch_validation_passed`
+cho biết diff có pass validation hay không.
