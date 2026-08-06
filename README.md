@@ -5,17 +5,20 @@ LLM cùng kết quả build/test cách ly**.
 
 ```text
 /path/to/project
-  -> tạo snapshot writable cách ly, không có git history thật, cho Codex
-  -> Codex tự đọc manifest/CI/docs, cài dependency, build/test, làm FL + APR
-  -> lưu nguyên phản hồi Codex và raw unified diff trước khi validation
-  -> apply toàn bộ diff vào một bản sao validation mới
-  -> tự provision/build/test lại đúng cùng phạm vi một lần
+  -> discovery manifests/lockfiles/CI/Dockerfile/version files
+  -> resolve EnvironmentSpec + plan digest
+  -> reuse container Defects4C đang chạy (mặc định) hoặc provision local/OCI
+  -> chạy failing test trên baseline sạch; bắt buộc phải reproduce failure
+  -> Codex nhận baseline evidence và làm FL + APR
+  -> apply patch vào bản sao sạch, cùng environment/plan digest
+  -> target failing tests pass + regression suite pass
   -> xuất raw unified diff + plausible/failing/invalid
 ```
 
-Framework không đọc metadata Defects4C, không cần ground truth, không dùng
-loader/validator/evaluator của `Unified-Debugging`, không có adapter theo tên
-project, và không cần Docker container riêng cho dataset.
+Framework không đọc ground truth hay gọi evaluator của `Unified-Debugging`. Với
+project Defects4C, framework có thể reuse container đã được operator provision
+theo Dockerfile của dataset (ví dụ `my_defects4c_libyang`) và chạy build/test
+trong container đó.
 
 ## Input và output
 
@@ -26,8 +29,9 @@ python -m src run /home/halinh/Unified_Debugging/defects4c/data/my-project \
   --failing-test tests/test_api.py::test_retries
 ```
 
-Có thể truyền `--failing-test` nhiều lần khi một bug làm fail nhiều test. Tên/ID
-này được đưa nguyên vào prompt Codex để làm failure signal chính cho FL/APR.
+Có thể truyền `--failing-test` nhiều lần khi một bug làm fail nhiều test. Framework
+resolve ID này thành target command theo test runner, chạy baseline trước FL/APR,
+và chỉ chấp nhận patch khi các target test pass cùng regression suite.
 
 Các thư mục `defectsc_tpl/projects*` không phải source project; chúng là recipe
 chứa nhiều bug/version. Dùng materializer của Defects4C để biến đúng một entry
@@ -67,6 +71,23 @@ python3 -m src run \
   --output /tmp/A.3.patch
 ```
 
+Với project libyang đã materialize và container Defects4C đang chạy, lệnh thực
+tế không cần cài native dependency trên host:
+
+```bash
+docker ps --format '{{.Names}}'
+python3 -m src doctor \
+  /home/halinh/Unified_Debugging/defects4c/data/CESNET___libyang__A.3__f128972045a5 \
+  --environment-backend container
+python3 -m src run \
+  /home/halinh/Unified_Debugging/defects4c/data/CESNET___libyang__A.3__f128972045a5 \
+  --failing-test utest_tree_schema_compile \
+  --output /tmp/libyang-A3.patch
+```
+
+`doctor` phải thấy `my_defects4c_libyang`; nếu không, khởi container theo
+`defects4c` hoặc đặt `DEFECTS4C_CONTAINER` trong `.env`.
+
 Hoặc xử lý tuần tự toàn bộ 15 project từ manifest và tách patch theo version:
 
 ```bash
@@ -89,6 +110,32 @@ Ví dụ record:
   "failing_tests": ["tests/test_api.py::test_retries"]
 }
 ```
+
+### Shortcut cho Defects4C
+
+Ngoài project path tổng quát, framework có adapter dataset riêng. Các shortcut
+`--libyang`, `--fmt` (hoặc `--defects4c <alias>`) tự tìm recipe, project đã
+materialize, container trong Dockerfile và failing test từ metadata:
+
+```bash
+python3 -m src run --libyang --bug-id A.3 --output /tmp/libyang-A3.patch
+python3 -m src run --fmt --bug-id 6a1346405949ca1 --output /tmp/fmt.patch
+python3 -m src run-batch --libyang --output-dir /tmp/libyang-patches
+```
+
+Nếu muốn ghi rõ test, vẫn có thể truyền `--failing-test`; option này được ưu tiên
+hơn metadata. Bug id trùng nhau phải dùng commit SHA/prefix để chọn đúng version.
+`run-batch --libyang` chạy lần lượt tất cả version materialized; thêm `--bug-id`
+nếu chỉ muốn chạy một version trong batch.
+Alias yêu cầu project đã được materialize dưới `defects4c/data`; ví dụ fmt:
+
+```bash
+cd /home/halinh/Unified_Debugging/defects4c
+python3 prepare_project.py fmtlib___fmt --bug B
+```
+
+Root Defects4C mặc định là thư mục sibling `../defects4c`, có thể đổi bằng
+`--defects4c-root` hoặc `DEBUGGING_DEFECTS4C_ROOT`.
 
 Output mặc định:
 
@@ -116,16 +163,25 @@ nguyên văn tại `attempts/attempt_NN/llm.patch.diff`, kể cả khi diff khô
 hoặc `patch_validation_passed` trong result để biết patch đã qua validation hay
 chưa.
 
+Artifact chính của một run gồm `baseline.json`, `baseline/`,
+`attempts/attempt_NN/validation/`, `run_manifest.json` và `result.json`.
+`result.json` giữ `plan_digest`, `environment_digest`, container/image digest,
+target test và regression outcome.
+
 Project đầu vào không bị chép đè: Codex và patched validation đều chạy trên
-bản sao tạm; từng lệnh build/test còn chạy trong Bubblewrap với filesystem host
-read-only và chỉ validation snapshot được ghi. Log, response và artifact audit
-nằm trong `<results-dir>/<project-name>/`.
+bản sao tạm; với backend mặc định, từng lệnh build/test chạy trong container
+đang cung cấp qua `docker exec`; backend `local` dùng Bubblewrap với filesystem
+host read-only. Log, response và artifact audit nằm trong
+`<results-dir>/<project-name>/`.
 
 Codex chạy với sandbox `workspace-write`, `approval_policy=never` trong snapshot
-tạm nên có thể chỉnh file, chạy package manager/formatter/build/test và dùng
-`git diff`. Network của sandbox được bật để tải dependency do project khai báo;
-prompt cấm cài package hệ thống hoặc tìm lời giải bên ngoài. Mọi side effect trong
-snapshot này bị xoá sau attempt. `repair.diff` là artifact có thẩm quyền:
+tạm nên có thể chỉnh file, chạy formatter/build/test và dùng `git diff`. Framework
+đã resolve/provision môi trường và gửi baseline evidence; Codex không còn là thành
+phần quyết định environment contract. Mọi side effect trong snapshot này bị xoá
+sau attempt. Toàn bộ log baseline được lưu audit ở `baseline/baseline-output.txt`
+và được chép vào snapshot Codex tại `.debugging-framework/baseline-output.txt`;
+prompt chỉ trỏ tới file này để không nhúng log dài vào context. `repair.diff` là
+artifact có thẩm quyền:
 framework áp lại toàn bộ diff lên một validation snapshot mới, vì vậy patch chỉ
 pass nếu tự nó tái tạo được kết quả, không phụ thuộc file/cache mà Codex quên đưa
 vào diff.
@@ -141,13 +197,12 @@ biến recipe/dataset thành một source project thật; nó đặt từng vers
 Framework không phụ thuộc vào layout trên; nó chỉ dùng project path được truyền
 trên command line.
 
-## Auto-provisioning, build và test
+## Discovery, environment provisioning, build và test
 
-Lệnh `run` có hai stage. Trước hết Codex tự khám phá workflow và tự chạy các lệnh
-cần thiết trong snapshot của nó để FL/APR. Chỉ sau khi raw diff đã được lưu,
-validator mới tự nhận diện một plan xác định từ file chuẩn trong project, apply
-diff vào một bản sao sạch và chạy plan đó một lần. `inspect` và `doctor` chỉ là
-công cụ chẩn đoán validator, không phải bước bắt buộc.
+Lệnh `run` có sáu stage: discovery, environment resolution, provisioning,
+baseline reproduction, FL/APR, và clean validation. EnvironmentSpec ghi lại
+manifest, lockfile, CI, version file, system package và digest của các file bằng
+chứng. Plan và environment digest phải giống nhau giữa baseline và patched run.
 
 | Project marker | Provisioning và validation tự động |
 | --- | --- |
@@ -164,11 +219,13 @@ công cụ chẩn đoán validator, không phải bước bắt buộc.
 | Ruby, Composer | bundle/composer install rồi chạy test |
 | Bazel, Ninja | build/test command chuẩn tương ứng |
 
-Patched validation bắt đầu từ source snapshot sạch và tự provision lại. Venv,
+Patched validation bắt đầu từ source snapshot sạch và provision lại cùng
+EnvironmentSpec. Venv,
 `node_modules`, vendor tree, package cache và build output chỉ tồn tại trong
 snapshot rồi bị xóa; chúng không được copy về input project và không xuất hiện
-trong patch. Lỗi auto-detection không ngăn Codex tự điều tra project trước; chỉ
-validation sau khi có diff mới yêu cầu build/test contract hợp lệ.
+trong patch. Nếu discovery hoặc environment resolution không xác định được
+workflow, pipeline dừng với lỗi contract/environment rõ ràng trước khi publish
+patch; Codex không được dùng để che giấu một baseline không tái hiện được.
 
 Với build system nội bộ không theo convention công khai, project có thể tự mô tả
 command bằng `.debugging-framework.json` ở project root. Đây là cấu hình thuộc
@@ -214,14 +271,20 @@ vậy validation về sau không cần quay lại đọc thư mục `defectsc_tp
 
 ## Phạm vi tự động hóa môi trường
 
-Framework tự cài **dependency cấp project** được khai báo trong manifest/lockfile.
-Nó không chạy `apt`, `dnf` hay thay đổi host. Compiler/runtime/package-manager
-(ví dụ JDK, Node, Cargo, CMake) là dependency của service chạy framework và nên
-được đóng sẵn trong image khi expose thành tool. Dependency native đặc thù không
-thể suy ra chắc chắn từ source; project phải khai báo lệnh tái lập trong field
-`setup` của `.debugging-framework.json`, hoặc service phải cung cấp image/backend
-phù hợp. Nếu thiếu executable hay setup thất bại, validation trả `setup_failed`
-và dừng fail-closed, không giả vờ patch đã pass.
+Framework mặc định dùng backend `container`: tìm container từ
+`DEFECTS4C_CONTAINER`, hoặc theo quy ước `my_defects4c_<project>` / `my_defects4c`,
+chép workspace tạm vào đó, rồi chạy baseline/build/test bằng `docker exec`. Vì
+image đã được operator dựng từ Dockerfile của dataset, native dependency không
+cần cài trên host.
+
+`local` là fallback/tuỳ chọn cho project thông thường và yêu cầu toolchain đã có
+trên host. `oci` là backend tự build image generic; nó không tự dùng một
+Dockerfile nằm ngoài project root. `auto` ưu tiên container đang chạy, sau đó OCI,
+cuối cùng local.
+
+Container có sẵn phải được chuẩn bị một lần bởi operator. Framework không tự
+`apt install` lên host và không tự khởi container vì việc đó phụ thuộc policy,
+volume mount và image của dataset.
 
 Vì vậy giao diện cho người dùng cuối vẫn là đúng một lệnh:
 
@@ -231,8 +294,15 @@ debugging-framework run /path/to/project \
   --output /tmp/fix.patch
 ```
 
-Việc cài framework/toolchain bên dưới là công việc một lần của người vận hành
-service, không phải thao tác lặp lại cho từng project.
+Có thể chỉ rõ container:
+
+```bash
+export DEFECTS4C_CONTAINER=my_defects4c_libyang
+debugging-framework --environment-backend container run /path/to/project \
+  --failing-test tests/test_api.py::test_retries
+```
+
+Hoặc cấu hình `DEBUGGING_ENVIRONMENT_CONTAINER` trong `.env`.
 
 Nếu nhận source upload không tin cậy từ nhiều người dùng, hãy chạy mỗi framework
 job trong container/VM riêng và không mount credential của host. Bubblewrap ở
@@ -241,9 +311,10 @@ không được xem là ranh giới multi-tenant thay cho container/VM.
 
 ## Cài đặt framework
 
-Yêu cầu Python `>=3.10`, Git, Codex CLI, Bubblewrap (`bwrap`) và các toolchain mà
-deployment muốn hỗ trợ. Nếu thiếu `bwrap`, validation fail-closed thay vì chạy
-lệnh project không cách ly.
+Yêu cầu Python `>=3.10`, Git, Codex CLI và Docker/Podman với container đã chạy
+khi dùng backend mặc định `container`. Backend `local` cần Bubblewrap (`bwrap`).
+Nếu backend đã chọn không khả dụng, validation fail-closed thay vì chạy lệnh
+project ngoài môi trường đã chỉ định.
 
 `pyproject.toml` là nguồn khai báo package/dependency duy nhất. Runtime không có
 Python dependency ngoài standard library; extra `test` chỉ thêm `pytest`.
@@ -290,9 +361,8 @@ debugging-framework run /path/to/project \
   --attempts 2 --output /tmp/fix.patch
 ```
 
-Đây là lệnh duy nhất cần chạy cho mỗi project. Codex tự setup, tái hiện lỗi, làm
-fault localization/APR và trả diff trước; pipeline sau đó apply diff vào snapshot
-sạch và validation lại patch.
+Đây là lệnh duy nhất cần chạy cho mỗi project. Framework tự discovery, provision,
+tái hiện baseline, chạy FL/APR, rồi validate target test và regression suite.
 
 Chạy mọi project đã materialize trong một manifest:
 
@@ -322,6 +392,9 @@ DEBUGGING_COMMAND_TIMEOUT=1800
 DEBUGGING_JOBS=0
 DEBUGGING_INHERIT_CODEX_CONFIG=false
 DEBUGGING_RESULTS_DIR=./experiments
+DEBUGGING_ENVIRONMENT_BACKEND=container
+DEBUGGING_ENVIRONMENT_RUNTIME=auto
+DEBUGGING_ENVIRONMENT_CONTAINER=
 ```
 
 `DEBUGGING_JOBS=0` tự chọn mức parallelism an toàn. `DEBUGGING_TIMEOUT` là timeout
@@ -330,11 +403,17 @@ build hoặc test command.
 
 ## Bảo đảm validation
 
-- Codex luôn chạy trước trên một bản sao tạm; phản hồi JSON và raw diff được lưu
+- Baseline failing test luôn chạy trước Codex; baseline output và raw diff được lưu
   trước khi pipeline bắt đầu patch validation.
-- Patched validation chạy trên một bản sao cách ly. Bubblewrap mount
-  host read-only và chỉ cho phép ghi vào snapshot tạm, nên input project không bị
-  thay source hoặc giữ build artifact của patch.
+- Nếu failing test không reproduce được, pipeline dừng với `baseline_not_reproduced`;
+  không gọi Codex và không publish patch xanh.
+- Target failing test được chạy riêng sau patch, sau đó regression suite được chạy
+  trên cùng environment/plan digest.
+- EnvironmentSpec, image/runtime, file evidence và digest được lưu trong result.
+- Patched validation chạy trên một bản sao cách ly. Container được chép workspace
+  tạm vào đường dẫn riêng rồi xoá sau run; backend local dùng Bubblewrap mount
+  host read-only. Vì vậy input project không bị thay source hoặc giữ build
+  artifact của patch.
 - Patched validation phải build được và phải có bằng chứng ít nhất một test thực sự chạy.
 - Dependency setup chạy tự động trước patched build/test; kết quả
   ghi rõ `setup_executed`, `environment_provisioned` và log từng setup command.
@@ -356,8 +435,9 @@ Kết quả validation phản ánh trực tiếp trạng thái của bản đã 
 
 | `status` | Ý nghĩa |
 | --- | --- |
-| `plausible` | Diff apply được, build pass và tất cả test đã chạy đều pass |
-| `failing` | Diff apply được nhưng có test fail |
+| `plausible` | Target failing tests và regression suite đều pass |
+| `failing` | Patch apply được nhưng target/regression test còn fail |
+| `invalid` | Baseline/environment/contract/patch không xác minh được |
 
 `invalid` được giữ riêng cho lỗi hạ tầng/contract, chẳng hạn không build được,
 không xác minh được test đã chạy hoặc diff không apply được. Raw diff vẫn được

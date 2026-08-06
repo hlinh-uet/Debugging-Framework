@@ -14,6 +14,7 @@ DEFAULT_RESULTS_DIR = (
     if os.environ.get("XDG_STATE_HOME")
     else Path.home() / ".local" / "state"
 ) / "debugging-framework" / "results"
+DEFAULT_DEFECTS4C_ROOT = PROJECT_ROOT.parent / "defects4c"
 
 # Old keys stay accepted so an existing .env does not prevent the new project-first CLI
 # from starting. They are deliberately not used by the runtime.
@@ -23,6 +24,9 @@ KNOWN_ENV_KEYS = {
     "DEBUGGING_CODEX_MODEL", "DEBUGGING_CODEX_BIN", "DEBUGGING_ATTEMPTS",
     "DEBUGGING_TIMEOUT", "DEBUGGING_COMMAND_TIMEOUT", "DEBUGGING_JOBS",
     "DEBUGGING_INHERIT_CODEX_CONFIG", "DEBUGGING_RESULTS_DIR",
+    "DEBUGGING_ENVIRONMENT_BACKEND", "DEBUGGING_ENVIRONMENT_RUNTIME",
+    "DEBUGGING_ENVIRONMENT_CONTAINER",
+    "DEBUGGING_DEFECTS4C_ROOT",
     "DEBUGGING_DATASET", "DEBUGGING_BUG_IDS", "DEBUGGING_INCLUDE_FIXED_FAIL_TESTS",
     "DEBUGGING_ONLY_MISSING", "DEBUGGING_EVALUATE", "DEBUGGING_UNIFIED_ROOT",
     "DEFECTS4C_CONTAINER",
@@ -121,6 +125,10 @@ class FrameworkConfig:
     command_timeout_seconds: int = 1800
     jobs: int = 0
     inherit_codex_config: bool = False
+    environment_backend: str = "container"
+    environment_runtime: str = "auto"
+    environment_container: str = ""
+    defects4c_root: Path = DEFAULT_DEFECTS4C_ROOT
 
     @classmethod
     def load(
@@ -153,6 +161,15 @@ class FrameworkConfig:
             inherit_codex_config=_bool(
                 "DEBUGGING_INHERIT_CODEX_CONFIG", get("DEBUGGING_INHERIT_CODEX_CONFIG", "false")
             ),
+            environment_backend=get("DEBUGGING_ENVIRONMENT_BACKEND", "container"),
+            environment_runtime=get("DEBUGGING_ENVIRONMENT_RUNTIME", "auto"),
+            environment_container=(
+                get("DEBUGGING_ENVIRONMENT_CONTAINER", "")
+                or get("DEFECTS4C_CONTAINER", "")
+            ),
+            defects4c_root=_path(
+                get("DEBUGGING_DEFECTS4C_ROOT"), DEFAULT_DEFECTS4C_ROOT
+            ),
         )
 
 
@@ -165,6 +182,10 @@ class Settings:
     codex_base_url: str = ""
     codex_wire_api: str = "responses"
     codex_env_key: str = "CODEX_API_KEY"
+    environment_backend: str = "container"
+    environment_runtime: str = "auto"
+    environment_container: str = ""
+    defects4c_root: Path = DEFAULT_DEFECTS4C_ROOT
 
     @property
     def output_schema(self) -> Path:
@@ -173,6 +194,10 @@ class Settings:
     def validated(self) -> "Settings":
         if not self.output_schema.is_file():
             raise FileNotFoundError(f"Thiếu Codex output schema: {self.output_schema}")
+        if self.environment_backend not in {"local", "oci", "container", "auto"}:
+            raise ValueError(
+                "DEBUGGING_ENVIRONMENT_BACKEND phải là local, oci, container hoặc auto"
+            )
         return Settings(
             results_dir=self.results_dir.expanduser().resolve(),
             codex_executable=self.codex_executable,
@@ -181,4 +206,8 @@ class Settings:
             codex_base_url=self.codex_base_url,
             codex_wire_api=self.codex_wire_api,
             codex_env_key=self.codex_env_key,
+            environment_backend=self.environment_backend,
+            environment_runtime=self.environment_runtime,
+            environment_container=self.environment_container,
+            defects4c_root=self.defects4c_root.expanduser().resolve(),
         )

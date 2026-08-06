@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import Iterable
 
 from src.loaders.project import Project
+from src.environments.docker import DockerProvision, RunningDockerEnvironment
+from src.environments.oci import OCIEnvironment, OCIProvision
+from src.environments.spec import EnvironmentResolver, EnvironmentSpec
 from src.utils.workspace import ValidationWorkspace, normalize_relpath
 
 
@@ -51,6 +54,8 @@ ZERO_TEST_PATTERNS = tuple(
         r"ran 0 tests",
         r"tests? run:\s*0\b",
         r"\[no test files\]",
+        r"\[no tests? to run\]",
+        r"no tests? (?:to run|to execute)",
     )
 )
 
@@ -59,7 +64,6 @@ TEST_FAILURE_PATTERNS = tuple(
     for pattern in (
         r"\b[1-9]\d*\s+failed\b",
         r"\btest result:\s*failed\b",
-        r"\btests? failed\b",
         r"\bfail(?:ures?)?:\s*[1-9]\d*\b",
         r"\berrors?:\s*[1-9]\d*\b",
         r"^\s*not ok\s+[1-9]\d*\b",
@@ -459,7 +463,7 @@ class BuildDetector:
         for requirement in requirements:
             install_args.extend(("-r", requirement))
         if BuildDetector._python_is_installable(root):
-            install_args.extend(("-e", ".[test]"))
+            install_args.extend(("-e", ".[test]" if BuildDetector._python_has_test_extra(root) else "."))
         install_args.append("pytest")
         return BuildPlan(
             "python",
@@ -492,6 +496,23 @@ class BuildDetector:
             )
         )
 
+    @staticmethod
+    def _python_has_test_extra(root: Path) -> bool:
+        """Only request an optional test extra when the project declares it."""
+        pyproject = root / "pyproject.toml"
+        if pyproject.is_file():
+            text = pyproject.read_text(encoding="utf-8", errors="replace")
+            if re.search(r"(?m)^\s*test\s*=\s*\[", text):
+                return True
+            if re.search(r"(?m)^\s*test\s*=\s*\{", text):
+                return True
+        setup_cfg = root / "setup.cfg"
+        if setup_cfg.is_file() and re.search(
+            r"(?m)^\s*test\s*=", setup_cfg.read_text(encoding="utf-8", errors="replace")
+        ):
+            return True
+        return False
+
 
 class ProjectValidator:
     """Run isolated validation on a project or an applied diff."""
@@ -502,10 +523,44 @@ class ProjectValidator:
         command_timeout: int = 1800,
         jobs: int = 0,
         sandbox_executable: str = "bwrap",
+        environment_backend: str = "local",
+        environment_runtime: str = "auto",
+        environment_container: str = "",
     ):
         self.command_timeout = command_timeout
         self.detector = BuildDetector(jobs=jobs)
         self.sandbox_executable = shutil.which(sandbox_executable)
+        if environment_backend not in {"local", "container", "oci", "auto"}:
+            raise ValueError(
+                "environment_backend phải là local, container, oci hoặc auto"
+            )
+        self.environment_backend = environment_backend
+        self.environment_runtime = OCIEnvironment(runtime=environment_runtime)
+        self.environment_container = RunningDockerEnvironment(
+            runtime=environment_runtime,
+            container=environment_container,
+            timeout_seconds=command_timeout,
+        )
+        self.environment_resolver = EnvironmentResolver()
+        self._active_provision: OCIProvision | DockerProvision | None = None
+
+    def resolve_environment(self, project: Project, plan: BuildPlan | None = None) -> EnvironmentSpec:
+        plan = plan or self.inspect(project)
+        backend = self.environment_backend
+        if backend == "auto":
+            backend = (
+                "container"
+                if self.environment_container.resolve_container(project.project_id)
+                else "oci"
+                if self.environment_runtime.available
+                else "local"
+            )
+        return self.environment_resolver.resolve(project.path, plan.system, backend=backend)
+
+    @staticmethod
+    def plan_digest(plan: BuildPlan) -> str:
+        encoded = json.dumps(plan.as_dict(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def inspect(self, project: Project) -> BuildPlan:
         plan = self.detector.detect(project.path)
@@ -513,17 +568,56 @@ class ProjectValidator:
             raise ValueError(f"Không tìm thấy test command cho project {project.path}")
         return plan
 
-    def baseline(self, project: Project, artifact_dir: Path) -> dict:
-        """Run an explicit clean-project diagnostic; the APR pipeline does not call this."""
+    def baseline(
+        self,
+        project: Project,
+        artifact_dir: Path,
+        *,
+        failing_tests: tuple[str, ...] = (),
+        expected_plan_digest: str = "",
+        expected_environment_digest: str = "",
+    ) -> dict:
+        """Reproduce the supplied failing test on a clean project snapshot."""
         self._require_artifacts_outside_input(project, artifact_dir)
-        if not self.sandbox_executable:
+        if self._requires_bwrap() and not self.sandbox_executable:
             return self.invalid_snapshot("validation_sandbox_unavailable:bwrap")
         with ValidationWorkspace(project) as workspace:
             snapshot_project = Project(path=workspace.path, project_id=project.project_id)
             plan = self.inspect(snapshot_project)
-            snapshot = self._run_plan(
-                workspace.path, plan, artifact_dir, prefix="baseline"
-            )
+            plan_digest = self.plan_digest(plan)
+            if expected_plan_digest and plan_digest != expected_plan_digest:
+                return self.invalid_snapshot("validation_plan_changed_before_baseline")
+            environment = self.resolve_environment(snapshot_project, plan)
+            if expected_environment_digest and environment.digest != expected_environment_digest:
+                return self.invalid_snapshot("validation_environment_changed_before_baseline")
+            provision = None
+            try:
+                provision = self._provision_environment(
+                    environment,
+                    artifact_dir / "environment",
+                    workspace.path,
+                    project_id=project.project_id,
+                )
+                self._active_provision = provision
+                if failing_tests:
+                    snapshot = self._run_target_baseline(
+                        workspace.path, plan, artifact_dir, failing_tests
+                    )
+                else:
+                    snapshot = self._run_plan(
+                        workspace.path, plan, artifact_dir, prefix="baseline"
+                    )
+            except Exception as exc:
+                snapshot = self.invalid_snapshot(
+                    f"environment_provision_failed:{type(exc).__name__}:{exc}"
+                )
+            finally:
+                self._cleanup_environment(provision)
+                self._active_provision = None
+        self._attach_environment_result(snapshot, environment, provision)
+        snapshot["environment"] = environment.as_dict()
+        snapshot["environment_digest"] = environment.digest
+        snapshot["plan_digest"] = plan_digest
         snapshot["validation_workspace_isolated"] = True
         snapshot["input_project_untouched"] = True
         return snapshot
@@ -536,9 +630,13 @@ class ProjectValidator:
         patch_paths: list[str],
         artifact_dir: Path,
         expected_sha256s: dict[str, str | None] | None = None,
+        failing_tests: tuple[str, ...] = (),
+        expected_plan_digest: str = "",
+        expected_environment_digest: str = "",
+        expected_image_digest: str = "",
     ) -> dict:
         self._require_artifacts_outside_input(project, artifact_dir)
-        if not self.sandbox_executable:
+        if self._requires_bwrap() and not self.sandbox_executable:
             return self.invalid_snapshot("validation_sandbox_unavailable:bwrap")
         normalized_paths = [normalize_relpath(path) for path in patch_paths]
         if not normalized_paths or any(not path for path in normalized_paths):
@@ -565,11 +663,49 @@ class ProjectValidator:
             # must not be able to select an easier test command by modifying
             # project configuration before auto-detection.
             plan = self.inspect(snapshot_project)
+            plan_digest = self.plan_digest(plan)
+            if expected_plan_digest and plan_digest != expected_plan_digest:
+                return self.invalid_snapshot("validation_plan_changed_before_patch")
+            environment = self.resolve_environment(snapshot_project, plan)
+            if expected_environment_digest and environment.digest != expected_environment_digest:
+                return self.invalid_snapshot("validation_environment_changed_before_patch")
             applied_paths = workspace.apply_unified_diff(diff, normalized_paths)
-            snapshot = self._run_plan(
-                workspace.path, plan, artifact_dir, prefix="patched"
-            )
+            provision = None
+            try:
+                provision = self._provision_environment(
+                    environment,
+                    artifact_dir / "environment",
+                    workspace.path,
+                    project_id=project.project_id,
+                )
+                if (
+                    expected_image_digest
+                    and provision is not None
+                    and provision.image_digest != expected_image_digest
+                ):
+                    snapshot = self.invalid_snapshot("validation_environment_image_changed")
+                else:
+                    self._active_provision = provision
+                    if failing_tests:
+                        snapshot = self._run_target_and_regression(
+                            workspace.path, plan, artifact_dir, failing_tests
+                        )
+                    else:
+                        snapshot = self._run_plan(
+                            workspace.path, plan, artifact_dir, prefix="patched"
+                        )
+            except Exception as exc:
+                snapshot = self.invalid_snapshot(
+                    f"environment_provision_failed:{type(exc).__name__}:{exc}"
+                )
+            finally:
+                self._cleanup_environment(provision)
+                self._active_provision = None
         snapshot["patch_paths"] = applied_paths
+        self._attach_environment_result(snapshot, environment, provision)
+        snapshot["environment"] = environment.as_dict()
+        snapshot["environment_digest"] = environment.digest
+        snapshot["plan_digest"] = plan_digest
         snapshot["validation_workspace_isolated"] = True
         snapshot["input_project_untouched"] = True
         return snapshot
@@ -583,12 +719,236 @@ class ProjectValidator:
             "failed_test_ids": [],
             "passed_test_ids": [],
             "test_id_granularity": "none",
+            "target_tests": [],
+            "target_commands": [],
+            "target_passed": False,
             "environment_provisioned": False,
             "setup_executed": False,
             "validation_workspace_isolated": True,
-            "validation_process_sandboxed": bool(self.sandbox_executable),
+            "validation_process_sandboxed": bool(
+                self.sandbox_executable
+                if self._requires_bwrap()
+                else self.environment_container.runtime_available
+                if self.environment_backend == "container"
+                else self.environment_runtime.available
+            ),
             "input_project_untouched": True,
         }
+
+    def _requires_bwrap(self) -> bool:
+        backend = self.environment_backend
+        if backend == "auto":
+            backend = (
+                "container"
+                if self.environment_container.runtime_available
+                else "oci"
+                if self.environment_runtime.available
+                else "local"
+            )
+        return backend == "local"
+
+    def _provision_environment(
+        self,
+        spec: EnvironmentSpec,
+        artifact_dir: Path,
+        project_root: Path | None = None,
+        *,
+        project_id: str = "",
+    ):
+        if spec.backend == "container":
+            return self.environment_container.provision(
+                spec,
+                artifact_dir,
+                project_root,
+                project_id=project_id,
+            )
+        if spec.backend == "oci":
+            return self.environment_runtime.provision(spec, artifact_dir, project_root)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        return None
+
+    def _cleanup_environment(self, provision) -> None:
+        if isinstance(provision, DockerProvision):
+            self.environment_container.cleanup(provision)
+
+    @staticmethod
+    def _attach_environment_result(snapshot: dict, spec: EnvironmentSpec, provision) -> None:
+        snapshot["environment_backend"] = spec.backend
+        if provision is not None:
+            snapshot["environment_provisioned"] = True
+            snapshot["provisioned_image"] = getattr(provision, "image", "")
+            snapshot["provisioned_image_digest"] = getattr(provision, "image_digest", "")
+            snapshot["provisioned_container"] = getattr(provision, "container", "")
+        else:
+            snapshot.setdefault("environment_provisioned", bool(snapshot.get("setup_commands")))
+
+    def _run_target_baseline(
+        self,
+        root: Path,
+        plan: BuildPlan,
+        artifact_dir: Path,
+        failing_tests: tuple[str, ...],
+    ) -> dict:
+        target_commands = self._target_commands(plan, failing_tests)
+        snapshot = self._run_plan(
+            root,
+            plan,
+            artifact_dir,
+            prefix="baseline-target",
+            test_commands=target_commands,
+        )
+        snapshot["target_tests"] = list(failing_tests)
+        snapshot["target_commands"] = [item.as_dict() for item in target_commands]
+        output_path = artifact_dir / "baseline-output.txt"
+        output_path.write_text(
+            str(snapshot.get("execution_output") or ""),
+            encoding="utf-8",
+            errors="replace",
+        )
+        snapshot["baseline_output_artifact"] = str(output_path)
+        if snapshot.get("status") == "failing":
+            if not self._target_ids_verified(
+                snapshot.get("failed_test_ids", []), failing_tests
+            ):
+                snapshot["status"] = "invalid"
+                snapshot["validation_error"] = "baseline_target_test_unverified"
+                snapshot["baseline_reproduced"] = False
+                return snapshot
+            snapshot["baseline_reproduced"] = True
+            snapshot["validation_error"] = ""
+            return snapshot
+        if snapshot.get("status") == "plausible":
+            snapshot["status"] = "invalid"
+            snapshot["validation_error"] = "baseline_not_reproduced"
+        elif snapshot.get("validation_error"):
+            snapshot["validation_error"] = "baseline_" + str(snapshot["validation_error"])
+        else:
+            snapshot["validation_error"] = "baseline_not_reproduced"
+        snapshot["baseline_reproduced"] = False
+        return snapshot
+
+    def _run_target_and_regression(
+        self,
+        root: Path,
+        plan: BuildPlan,
+        artifact_dir: Path,
+        failing_tests: tuple[str, ...],
+    ) -> dict:
+        target_commands = self._target_commands(plan, failing_tests)
+        target = self._run_plan(
+            root,
+            plan,
+            artifact_dir,
+            prefix="patched-target",
+            test_commands=target_commands,
+        )
+        target["target_tests"] = list(failing_tests)
+        target["target_commands"] = [item.as_dict() for item in target_commands]
+        target["target_status"] = target.get("status")
+        if target.get("status") != "plausible":
+            target["status"] = "failing" if target.get("status") == "failing" else "invalid"
+            target["validation_error"] = (
+                "target_test_failed" if target["status"] == "failing"
+                else "target_test_invalid:" + str(target.get("validation_error") or "unknown")
+            )
+            return target
+        if not self._target_ids_verified(target.get("passed_test_ids", []), failing_tests):
+            target["status"] = "invalid"
+            target["validation_error"] = "target_test_unverified"
+            return target
+
+        regression = self._run_plan(root, plan, artifact_dir, prefix="patched-regression")
+        regression["target_tests"] = list(failing_tests)
+        regression["target_commands"] = [item.as_dict() for item in target_commands]
+        regression["target_status"] = "plausible"
+        regression["target_passed"] = True
+        regression["target_output"] = "\n\n".join(
+            item.get("output", "") for item in target.get("test_commands", [])
+        )
+        if regression.get("status") != "plausible":
+            regression["validation_error"] = (
+                "regression_failed" if regression.get("status") == "failing"
+                else "regression_invalid:" + str(regression.get("validation_error") or "unknown")
+            )
+        return regression
+
+    @staticmethod
+    def _target_ids_verified(observed: object, requested: tuple[str, ...]) -> bool:
+        values = {
+            str(value).strip() for value in (observed if isinstance(observed, list) else [])
+            if str(value).strip() and not str(value).startswith("command:")
+        }
+        if not values:
+            return False
+        return all(
+            any(
+                ProjectValidator._canonical_test_id(requested_id)
+                == ProjectValidator._canonical_test_id(value)
+                or ProjectValidator._canonical_test_id(requested_id).endswith(
+                    ProjectValidator._canonical_test_id(value)
+                )
+                or ProjectValidator._canonical_test_id(value).endswith(
+                    ProjectValidator._canonical_test_id(requested_id)
+                )
+                for value in values
+            )
+            for requested_id in requested
+        )
+
+    @staticmethod
+    def _canonical_test_id(value: str) -> str:
+        return str(value).strip().replace("#", "::")
+
+    @staticmethod
+    def _target_commands(plan: BuildPlan, failing_tests: tuple[str, ...]) -> tuple[CommandSpec, ...]:
+        """Turn user-facing test IDs into runner-specific target commands."""
+        selectors = tuple(str(value).strip() for value in failing_tests if str(value).strip())
+        if not selectors:
+            return plan.test
+        system = plan.system.strip().lower()
+        commands: list[CommandSpec] = []
+        for spec in plan.test:
+            argv = list(spec.argv)
+            command_text = " ".join(argv)
+            if system == "python" or "pytest" in argv or "pytest" in command_text:
+                if "pytest" in argv:
+                    if "-q" in argv:
+                        argv[argv.index("-q")] = "-vv"
+                    elif not any(item.startswith("-") and "v" in item for item in argv):
+                        argv.append("-vv")
+                argv.extend(selectors)
+            elif system == "node" or argv[:1] in (["npm"], ["pnpm"], ["yarn"]):
+                argv.extend(["--", *selectors])
+            elif system == "cargo" or "cargo" in argv:
+                try:
+                    index = argv.index("test") + 1
+                except ValueError:
+                    index = len(argv)
+                argv[index:index] = [selectors[0]]
+            elif system == "go" or "go" in argv:
+                argv.extend(["-run", "^(?:" + "|".join(re.escape(item) for item in selectors) + ")$"])
+            elif system == "maven" or "mvn" in command_text:
+                argv.extend([f"-Dtest={','.join(selectors)}"])
+            elif system == "gradle" or "gradle" in command_text:
+                for selector in selectors:
+                    argv.extend(["--tests", selector])
+            elif system == "cmake" or "ctest" in command_text:
+                argv.extend(["-R", "|".join(re.escape(item) for item in selectors)])
+            elif system == "dotnet" or "dotnet" in command_text:
+                argv.extend(["--filter", "|".join(f"Name~{item}" for item in selectors)])
+            else:
+                # For custom runners, executing the declared command is safer
+                # than inventing shell syntax.  The report/output evidence is
+                # still required by the normal validator.
+                pass
+            commands.append(CommandSpec(
+                label=f"target-{spec.label}",
+                argv=tuple(argv),
+                cwd=spec.cwd,
+                evidence_pattern=spec.evidence_pattern,
+                failure_pattern=spec.failure_pattern,
+            ))
+        return tuple(commands)
 
     @staticmethod
     def _require_artifacts_outside_input(project: Project, artifact_dir: Path) -> None:
@@ -600,20 +960,28 @@ class ProjectValidator:
             return
         raise ValueError(f"Validation artifacts phải nằm ngoài input project: {target}")
 
-    def _run_plan(self, root: Path, plan: BuildPlan, artifact_dir: Path, prefix: str) -> dict:
+    def _run_plan(
+        self,
+        root: Path,
+        plan: BuildPlan,
+        artifact_dir: Path,
+        prefix: str,
+        test_commands: Iterable[CommandSpec] | None = None,
+    ) -> dict:
         setup = self._run_commands(root, plan.setup, artifact_dir, f"{prefix}-setup")
         if not all(item.ok for item in setup):
             return self._snapshot(plan, setup, [], [], "invalid", "setup_failed")
         build = self._run_commands(root, plan.build, artifact_dir, f"{prefix}-build")
         if not all(item.ok for item in build):
             return self._snapshot(plan, setup, build, [], "invalid", "build_failed")
+        active_tests = tuple(test_commands or plan.test)
         reports_before = self._test_report_state(root)
-        tests = self._run_commands(root, plan.test, artifact_dir, f"{prefix}-test")
+        tests = self._run_commands(root, active_tests, artifact_dir, f"{prefix}-test")
         if not tests:
             return self._snapshot(plan, setup, build, tests, "invalid", "no_test_command")
         report_summary = (
             self._structured_test_summary(root, reports_before)
-            if len(plan.test) == 1 else None
+            if len(active_tests) == 1 else None
         )
         test_case_results = self._test_case_results(root, reports_before, tests)
 
@@ -644,7 +1012,7 @@ class ProjectValidator:
             return snapshot("invalid", "test_runner_unavailable")
         unverified = [
             result.label
-            for spec, result in zip(plan.test, tests)
+            for spec, result in zip(active_tests, tests)
             if not self._has_test_execution_evidence(
                 plan.system, spec, result, report_count if len(tests) == 1 else None
             )
@@ -656,7 +1024,7 @@ class ProjectValidator:
                 (report_failures is not None and report_failures > 0)
                 or self._output_reports_test_failure(spec, result)
             )
-            for spec, result in zip(plan.test, tests)
+            for spec, result in zip(active_tests, tests)
         ]
         conflicts = [
             result.label
@@ -674,7 +1042,10 @@ class ProjectValidator:
             return snapshot("invalid", "test_failure_unverified:" + ",".join(unverified_failures))
         tests_ok = all(item.ok for item in tests)
         status = "plausible" if tests_ok else "failing"
-        return snapshot(status, "")
+        value = snapshot(status, "")
+        value["test_scope"] = "target" if test_commands is not None else "regression"
+        value["test_commands"] = [item.as_dict() for item in active_tests]
+        return value
 
     @staticmethod
     def _has_test_execution_evidence(
@@ -834,6 +1205,11 @@ class ProjectValidator:
                 output_ids_found = True
                 for test_id in extracted:
                     cases[test_id] = False
+            passed = cls._passed_test_ids_from_output(command.output)
+            if passed:
+                output_ids_found = True
+                for test_id in passed:
+                    cases[test_id] = cases.get(test_id, True) and True
         if not any(not passed for passed in cases.values()) and not output_ids_found:
             for command in commands:
                 if not command.ok:
@@ -847,6 +1223,7 @@ class ProjectValidator:
             r"(?m)^FAILED\s+([^\s]+)",
             r"(?m)^test\s+(.+?)\s+\.\.\.\s+FAILED\s*$",
             r"(?m)^\s*\d+/\d+\s+Test\s+#\d+:\s+(.+?)\s+\.{2,}\*{3}Failed",
+            r"(?m)^\s*---\s+FAIL:\s+(\S+)",
         )
         for pattern in patterns:
             failed.update(
@@ -868,6 +1245,21 @@ class ProjectValidator:
                 name = str(event["Test"]).strip()
                 failed.add(f"{package}::{name}" if package else name)
         return failed
+
+    @staticmethod
+    def _passed_test_ids_from_output(output: str) -> set[str]:
+        passed: set[str] = set()
+        for pattern in (
+            r"(?m)^PASSED\s+([^\s]+)",
+            r"(?m)^test\s+(.+?)\s+\.\.\.\s+PASSED\s*$",
+            r"(?m)^\s*---\s+PASS:\s+(\S+)",
+            r"(?m)^\s*test\s+(.+?)\s+\.\.\.\s+ok\s*$",
+            r"(?m)^\s*\d+/\d+\s+Test\s+#\d+:\s+(.+?)\s+\.{2,}Passed",
+        ):
+            passed.update(
+                match.strip() for match in re.findall(pattern, output) if match.strip()
+            )
+        return passed
 
     def _snapshot(
         self,
@@ -909,8 +1301,27 @@ class ProjectValidator:
                 else "none"
             ),
             "failure_output": "\n\n".join(item.output[-20_000:] for item in tests if not item.ok),
-            "validation_process_sandboxed": True,
+            "execution_output": self._execution_output(setup, build, tests),
+            "validation_process_sandboxed": bool(
+                self._active_provision is not None or self.sandbox_executable
+            ),
         }
+
+    @staticmethod
+    def _execution_output(
+        setup: list[CommandResult],
+        build: list[CommandResult],
+        tests: list[CommandResult],
+    ) -> str:
+        sections: list[str] = []
+        for phase, commands in (("setup", setup), ("build", build), ("test", tests)):
+            for result in commands:
+                sections.append(
+                    f"===== {phase}:{result.label} "
+                    f"(returncode={result.returncode}, timed_out={result.timed_out}) =====\n"
+                    f"{result.output or ''}"
+                )
+        return "\n\n".join(sections)
 
     def _run_commands(
         self,
@@ -930,17 +1341,33 @@ class ProjectValidator:
             if not cwd.is_dir():
                 result = CommandResult(spec.label, list(spec.argv), str(cwd), 127, "cwd_missing", 0.0)
             else:
-                result = self._run_one(spec, cwd, root)
+                result = self._run_one(
+                    spec, cwd, root, network_allowed="setup" in log_prefix
+                )
             results.append(result)
             log = artifact_dir / f"{log_prefix}-{index:02d}-{_safe_label(spec.label)}.log"
             log.write_text(result.output, encoding="utf-8", errors="replace")
+            self._sync_active_workspace(root)
             if not result.ok:
                 break
         return results
 
-    def _run_one(self, spec: CommandSpec, cwd: Path, root: Path) -> CommandResult:
+    def _sync_active_workspace(self, root: Path) -> None:
+        if isinstance(self._active_provision, DockerProvision):
+            self.environment_container.sync_from_container(self._active_provision, root)
+
+    def _run_one(
+        self,
+        spec: CommandSpec,
+        cwd: Path,
+        root: Path,
+        *,
+        network_allowed: bool = False,
+    ) -> CommandResult:
         started = time.monotonic()
-        command = self._sandboxed_command(spec.argv, root, cwd)
+        command = self._sandboxed_command(
+            spec.argv, root, cwd, network_allowed=network_allowed
+        )
         try:
             process = subprocess.Popen(
                 command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -971,8 +1398,29 @@ class ProjectValidator:
         )
 
     def _sandboxed_command(
-        self, argv: tuple[str, ...], root: Path, cwd: Path
+        self,
+        argv: tuple[str, ...],
+        root: Path,
+        cwd: Path,
+        *,
+        network_allowed: bool = False,
     ) -> list[str]:
+        if isinstance(self._active_provision, OCIProvision):
+            return self.environment_runtime.command(
+                self._active_provision,
+                root,
+                argv,
+                cwd,
+                network=network_allowed,
+            )
+        if isinstance(self._active_provision, DockerProvision):
+            return self.environment_container.command(
+                self._active_provision,
+                root,
+                argv,
+                cwd,
+                network=network_allowed,
+            )
         if not self.sandbox_executable:
             raise RuntimeError("validation_sandbox_unavailable:bwrap")
         root = root.resolve()
@@ -1018,10 +1466,12 @@ class ProjectValidator:
             )
             if value
         )
+        network_options = ["--share-net"] if network_allowed else []
         return [
             self.sandbox_executable,
             "--die-with-parent",
             "--new-session",
+            *network_options,
             "--ro-bind",
             "/",
             "/",

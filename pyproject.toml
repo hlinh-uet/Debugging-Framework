@@ -25,6 +25,7 @@ packages = [
   "src.loaders",
   "src.utils",
   "src.validation",
+  "src.environments",
 ]
 
 [tool.pytest.ini_options]

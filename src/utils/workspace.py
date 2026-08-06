@@ -114,7 +114,8 @@ class ProjectWorkspace:
         (self.path / ".git" / "info" / "exclude").write_text(
             "node_modules/\n.venv/\nvenv/\ntarget/\nbuild/\ndist/\n"
             ".debugging-framework/build/\n.debugging-framework/environment/\n"
-            ".debugging-framework/venv/\n.debugging-framework/bundle/\n",
+            ".debugging-framework/venv/\n.debugging-framework/bundle/\n"
+            ".debugging-framework/baseline-output.txt\n",
             encoding="utf-8",
         )
         files = [

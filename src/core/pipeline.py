@@ -60,6 +60,51 @@ class DebuggingPipeline:
         }
         atomic_write_json(project_results / "run_manifest.json", manifest)
 
+        baseline_snapshot: dict | None = None
+        if options.failing_tests:
+            print("[baseline] provision/reproduce failing test trước khi FL/APR")
+            try:
+                baseline_snapshot = self.validator.baseline(
+                    project,
+                    project_results / "baseline",
+                    failing_tests=options.failing_tests,
+                )
+            except Exception as exc:
+                baseline_snapshot = self.validator.invalid_snapshot(
+                    f"baseline_exception:{type(exc).__name__}:{exc}"
+                )
+            baseline_output_path = project_results / "baseline" / "baseline-output.txt"
+            if baseline_output_path.is_file():
+                baseline_snapshot["baseline_output_artifact"] = str(
+                    baseline_output_path.relative_to(project_results)
+                )
+                baseline_snapshot["codex_snapshot_output_file"] = (
+                    ".debugging-framework/baseline-output.txt"
+                )
+            atomic_write_json(project_results / "baseline.json", baseline_snapshot)
+            manifest["baseline"] = {
+                "status": baseline_snapshot.get("status"),
+                "validation_error": baseline_snapshot.get("validation_error", ""),
+                "plan_digest": baseline_snapshot.get("plan_digest", ""),
+                "environment_digest": baseline_snapshot.get("environment_digest", ""),
+            }
+            if baseline_snapshot.get("status") != "failing" or not baseline_snapshot.get(
+                "baseline_reproduced", False
+            ):
+                result = {
+                    "status": "invalid",
+                    "validation_error": baseline_snapshot.get("validation_error")
+                    or "baseline_not_reproduced",
+                    "project": str(project.path),
+                    "output_patch": "",
+                    "patch_validation_passed": False,
+                    "failing_tests": list(options.failing_tests),
+                    "baseline": baseline_snapshot,
+                    "attempts": [],
+                    "fault_localization": {},
+                }
+                return self._finish(project_results, manifest, result)
+
         runner = self.runner_factory(
             executable=self.settings.codex_executable,
             schema_path=self.settings.output_schema,
@@ -86,9 +131,11 @@ class DebuggingPipeline:
                 attempt=attempt_index,
                 failing_tests=options.failing_tests,
                 previous_attempt=previous_feedback,
+                baseline=baseline_snapshot,
             )
             try:
                 with ProjectWorkspace(project, project_results / "workspaces") as workspace:
+                    self._write_baseline_context(workspace, baseline_snapshot)
                     run = runner.run(workspace=workspace.path, prompt=prompt, artifact_dir=attempt_dir)
                     payload_artifact = attempt_dir / "codex.payload.json"
                     atomic_write_json(payload_artifact, run.payload)
@@ -166,6 +213,14 @@ class DebuggingPipeline:
                             patch_paths=patch_paths,
                             artifact_dir=attempt_dir / "validation",
                             expected_sha256s=snapshot_hashes,
+                            failing_tests=options.failing_tests,
+                            expected_plan_digest=(baseline_snapshot or {}).get("plan_digest", ""),
+                            expected_environment_digest=(baseline_snapshot or {}).get(
+                                "environment_digest", ""
+                            ),
+                            expected_image_digest=(baseline_snapshot or {}).get(
+                                "provisioned_image_digest", ""
+                            ),
                         )
                     except Exception as exc:
                         snapshot = self.validator.invalid_snapshot(
@@ -188,6 +243,7 @@ class DebuggingPipeline:
                         "patch_paths_not_changed_in_workspace": sorted(
                             set(patch_paths) - set(workspace_changes)
                         )[:200],
+                        "baseline": baseline_snapshot or {},
                     }
                     candidates.append(candidate)
                     attempts.append(public_attempt(candidate))
@@ -242,20 +298,59 @@ class DebuggingPipeline:
                 "output_patch": str(output_patch) if published else "",
                 "llm_patch_artifact": latest["artifact"],
                 "patch_validation_passed": False,
+                "baseline": baseline_snapshot or {},
                 "attempts": attempts,
                 "fault_localization": self._fault_localization(payloads),
             }
         else:
+            terminal_attempt = min(attempts, key=candidate_sort_key) if attempts else {}
+            terminal_status = str(terminal_attempt.get("status") or "invalid")
+            if terminal_status not in STATUS_RANK:
+                terminal_status = "invalid"
+            terminal_error = str(
+                terminal_attempt.get("validation_error")
+                or terminal_attempt.get("codex_error")
+                or terminal_attempt.get("error")
+                or "codex_did_not_produce_applicable_patch"
+            )
             result = {
-                "status": "invalid",
-                "validation_error": "codex_did_not_produce_applicable_patch",
+                "status": terminal_status,
+                "validation_error": terminal_error,
                 "project": str(project.path),
                 "output_patch": "",
+                "llm_patch_artifact": terminal_attempt.get("llm_patch_artifact", ""),
+                "codex_response_artifact": terminal_attempt.get(
+                    "codex_response_artifact", ""
+                ),
+                "codex_events_artifact": terminal_attempt.get("codex_events_artifact", ""),
+                "codex_stderr_artifact": terminal_attempt.get("codex_stderr_artifact", ""),
                 "patch_validation_passed": False,
+                "baseline": baseline_snapshot or {},
                 "attempts": attempts,
                 "fault_localization": self._fault_localization(payloads),
             }
         return self._finish(project_results, manifest, result)
+
+    @staticmethod
+    def _write_baseline_context(workspace: ProjectWorkspace, baseline: dict | None) -> None:
+        """Make the complete baseline log available inside Codex's project snapshot.
+
+        The prompt points Codex at this file instead of embedding a potentially very
+        large command log. This preserves the full evidence while keeping prompt token
+        usage small and makes the input explicit and reproducible for every attempt.
+        """
+        if not baseline:
+            return
+        context_dir = workspace.path / ".debugging-framework"
+        if context_dir.exists() and context_dir.is_symlink():
+            return
+        context_dir.mkdir(parents=True, exist_ok=True)
+        context_file = context_dir / "baseline-output.txt"
+        context_file.write_text(
+            str(baseline.get("execution_output") or ""),
+            encoding="utf-8",
+            errors="replace",
+        )
 
     def _result(self, project, attempts, candidate, output_patch, payloads) -> dict:
         return {
@@ -271,6 +366,8 @@ class DebuggingPipeline:
             "codex_events_artifact": candidate.get("codex_events_artifact", ""),
             "codex_stderr_artifact": candidate.get("codex_stderr_artifact", ""),
             "patch_validation_passed": candidate.get("status") == "plausible",
+            "failing_tests": candidate.get("target_tests", []),
+            "baseline": candidate.get("baseline") or {},
             "validation": {
                 key: value for key, value in candidate.items()
                 if key in {
@@ -282,6 +379,10 @@ class DebuggingPipeline:
                     "input_project_untouched",
                     "patch_paths",
                     "failed_test_ids", "passed_test_ids", "test_id_granularity",
+                    "target_tests", "target_commands", "target_status", "target_passed",
+                    "baseline_reproduced", "environment", "environment_digest", "plan_digest",
+                    "environment_backend", "provisioned_image", "provisioned_image_digest",
+                    "provisioned_container",
                 }
             },
             "attempts": attempts,

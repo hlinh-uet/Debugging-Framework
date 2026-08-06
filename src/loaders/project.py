@@ -35,6 +35,12 @@ PROJECT_MARKERS = (
     "build.ninja",
     "GNUmakefile",
     "configure.in",
+    "Dockerfile",
+    "Containerfile",
+    ".devcontainer/devcontainer.json",
+    ".github/workflows",
+    ".gitlab-ci.yml",
+    ".circleci/config.yml",
 )
 
 
