@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -8,14 +9,24 @@ from typing import Optional
 from src.core.codex_runner import CodexRunner
 from src.core.prompts import build_codex_prompt
 from src.utils.jsonio import atomic_write_json, atomic_write_text, safe_name
-from src.utils.workspace import ProjectWorkspace, normalize_relpath
+from src.utils.workspace import (
+    CurrentProjectWorkspace,
+    ProjectWorkspace,
+    normalize_relpath,
+    normalize_unified_diff,
+)
 
 
 STATUS_RANK = {
     "plausible": 0,
-    "failing": 1,
-    "invalid": 5,
-    "llm_failed": 6,
+    "cleanfix": 1,
+    "noisefix": 2,
+    "nonefix": 3,
+    "negfix": 4,
+    # Kept for callers that construct PipelineOptions without a baseline.
+    "failing": 5,
+    "invalid": 6,
+    "llm_failed": 7,
 }
 
 
@@ -26,6 +37,8 @@ class PipelineOptions:
     codex_timeout_seconds: int = 1800
     inherit_codex_config: bool = False
     failing_tests: tuple[str, ...] = ()
+    external_baseline_output: str | None = None
+    workspace_mode: str = "auto"
 
 
 class DebuggingPipeline:
@@ -44,12 +57,19 @@ class DebuggingPipeline:
         output_patch = (output_patch or (project_results / "patch.diff")).expanduser().resolve()
         self._require_outside_input(project_root, project_results, "results")
         self._require_outside_input(project_root, output_patch, "patch output")
+        if options.workspace_mode not in {"auto", "snapshot", "current"}:
+            raise ValueError("workspace_mode phải là auto, snapshot hoặc current")
+        workspace_mode = options.workspace_mode
+        if workspace_mode == "auto":
+            workspace_mode = (
+                "current" if options.external_baseline_output is not None else "snapshot"
+            )
         project_results.mkdir(parents=True, exist_ok=True)
         self._prepare_output_target(output_patch)
 
         manifest = {
             "framework": "debugging-framework-project-repair",
-            "version": 6,
+            "version": 7,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "project": str(project.path),
             "project_id": project.project_id,
@@ -57,11 +77,28 @@ class DebuggingPipeline:
             "model": options.model or "codex-cli-default",
             "failing_tests": list(options.failing_tests),
             "output_patch": str(output_patch),
+            "baseline_source": (
+                "external" if options.external_baseline_output is not None else "framework"
+            ),
+            "codex_workspace": workspace_mode,
         }
         atomic_write_json(project_results / "run_manifest.json", manifest)
 
         baseline_snapshot: dict | None = None
-        if options.failing_tests:
+        if options.external_baseline_output is not None:
+            print("[baseline] dùng output do caller cung cấp; bỏ qua chạy lại failing test")
+            try:
+                baseline_snapshot = self.validator.external_baseline(
+                    project,
+                    project_results / "baseline",
+                    failing_tests=options.failing_tests,
+                    failure_output=options.external_baseline_output,
+                )
+            except Exception as exc:
+                baseline_snapshot = self.validator.invalid_snapshot(
+                    f"external_baseline_exception:{type(exc).__name__}:{exc}"
+                )
+        elif options.failing_tests:
             print("[baseline] provision/reproduce failing test trước khi FL/APR")
             try:
                 baseline_snapshot = self.validator.baseline(
@@ -73,6 +110,7 @@ class DebuggingPipeline:
                 baseline_snapshot = self.validator.invalid_snapshot(
                     f"baseline_exception:{type(exc).__name__}:{exc}"
                 )
+        if baseline_snapshot is not None:
             baseline_output_path = project_results / "baseline" / "baseline-output.txt"
             if baseline_output_path.is_file():
                 baseline_snapshot["baseline_output_artifact"] = str(
@@ -88,9 +126,14 @@ class DebuggingPipeline:
                 "plan_digest": baseline_snapshot.get("plan_digest", ""),
                 "environment_digest": baseline_snapshot.get("environment_digest", ""),
             }
-            if baseline_snapshot.get("status") != "failing" or not baseline_snapshot.get(
-                "baseline_reproduced", False
-            ):
+            baseline_accepted = bool(
+                baseline_snapshot.get("baseline_reproduced", False)
+                or (
+                    baseline_snapshot.get("baseline_external", False)
+                    and baseline_snapshot.get("baseline_observed", False)
+                )
+            )
+            if baseline_snapshot.get("status") != "failing" or not baseline_accepted:
                 result = {
                     "status": "invalid",
                     "validation_error": baseline_snapshot.get("validation_error")
@@ -122,6 +165,11 @@ class DebuggingPipeline:
         payloads: list[dict] = []
         raw_patches: list[dict] = []
         previous_feedback: dict | None = None
+        direct_workspace = (
+            CurrentProjectWorkspace(project) if workspace_mode == "current" else None
+        )
+        if direct_workspace is not None:
+            direct_workspace.__enter__()
         for attempt_index in range(1, options.attempts + 1):
             print(f"[attempt {attempt_index}/{options.attempts}] Codex đọc project và tạo patch")
             attempt_dir = project_results / "attempts" / f"attempt_{attempt_index:02d}"
@@ -132,9 +180,15 @@ class DebuggingPipeline:
                 failing_tests=options.failing_tests,
                 previous_attempt=previous_feedback,
                 baseline=baseline_snapshot,
+                workspace_mode=workspace_mode,
             )
             try:
-                with ProjectWorkspace(project, project_results / "workspaces") as workspace:
+                workspace_context = (
+                    nullcontext(direct_workspace)
+                    if direct_workspace is not None
+                    else ProjectWorkspace(project, project_results / "workspaces")
+                )
+                with workspace_context as workspace:
                     self._write_baseline_context(workspace, baseline_snapshot)
                     run = runner.run(workspace=workspace.path, prompt=prompt, artifact_dir=attempt_dir)
                     payload_artifact = attempt_dir / "codex.payload.json"
@@ -160,6 +214,15 @@ class DebuggingPipeline:
                     if raw_diff.strip():
                         raw_diff_path = attempt_dir / "llm.patch.diff"
                         atomic_write_text(raw_diff_path, raw_diff)
+                        normalized_diff, normalization_actions = normalize_unified_diff(raw_diff)
+                        if normalization_actions:
+                            normalized_path = attempt_dir / "normalized.patch.diff"
+                            atomic_write_text(normalized_path, normalized_diff)
+                            base_attempt["normalized_patch_artifact"] = str(
+                                normalized_path.relative_to(project_results)
+                            )
+                            base_attempt["diff_normalization_actions"] = normalization_actions
+                        raw_diff = normalized_diff
                         raw_record = {
                             "attempt": attempt_index,
                             "diff": raw_diff,
@@ -192,7 +255,11 @@ class DebuggingPipeline:
                             "patch_paths": patch_paths,
                         }
                         continue
-                    snapshot_hashes = workspace.snapshot_sha256s(patch_paths)
+                    snapshot_hashes = (
+                        None
+                        if getattr(workspace, "in_place", False)
+                        else workspace.snapshot_sha256s(patch_paths)
+                    )
                     workspace_changes = workspace.changed_repository_files()
                     localized = select_localizations(run.payload, patch_paths)
                     selected_functions = [
@@ -206,26 +273,39 @@ class DebuggingPipeline:
                         f"[attempt {attempt_index}/{options.attempts}] "
                         f"Apply/provision/build/test diff: {len(patch_paths)} file(s)"
                     )
-                    try:
-                        snapshot = self.validator.validate_diff(
-                            project=project,
-                            diff=raw_diff,
-                            patch_paths=patch_paths,
-                            artifact_dir=attempt_dir / "validation",
-                            expected_sha256s=snapshot_hashes,
-                            failing_tests=options.failing_tests,
-                            expected_plan_digest=(baseline_snapshot or {}).get("plan_digest", ""),
-                            expected_environment_digest=(baseline_snapshot or {}).get(
-                                "environment_digest", ""
-                            ),
-                            expected_image_digest=(baseline_snapshot or {}).get(
-                                "provisioned_image_digest", ""
-                            ),
+                    validation_context = (
+                        workspace.clean_source_for_validation()
+                        if getattr(workspace, "in_place", False)
+                        else nullcontext()
+                    )
+                    with validation_context as clean_project_path:
+                        validation_project = (
+                            replace(project, path=clean_project_path)
+                            if clean_project_path is not None
+                            else project
                         )
-                    except Exception as exc:
-                        snapshot = self.validator.invalid_snapshot(
-                            f"validation_exception:{type(exc).__name__}:{exc}"
-                        )
+                        try:
+                            snapshot = self.validator.validate_diff(
+                                project=validation_project,
+                                diff=raw_diff,
+                                patch_paths=patch_paths,
+                                artifact_dir=attempt_dir / "validation",
+                                expected_sha256s=snapshot_hashes,
+                                failing_tests=options.failing_tests,
+                                expected_plan_digest=(baseline_snapshot or {}).get("plan_digest", ""),
+                                expected_environment_digest=(baseline_snapshot or {}).get(
+                                    "environment_digest", ""
+                                ),
+                                expected_image_digest=(baseline_snapshot or {}).get(
+                                    "provisioned_image_digest", ""
+                                ),
+                            )
+                        except Exception as exc:
+                            snapshot = self.validator.invalid_snapshot(
+                                f"validation_exception:{type(exc).__name__}:{exc}"
+                            )
+                    if baseline_snapshot is not None:
+                        snapshot = classify_validation_result(baseline_snapshot, snapshot)
                     candidate = {
                         **base_attempt,
                         **snapshot,
@@ -261,6 +341,8 @@ class DebuggingPipeline:
                         result = self._result(
                             project, attempts, candidate, output_patch, payloads
                         )
+                        if direct_workspace is not None:
+                            direct_workspace.close()
                         return self._finish(project_results, manifest, result)
                     previous_feedback = {
                         "error": snapshot.get("validation_error") or "tests_still_fail",
@@ -305,7 +387,9 @@ class DebuggingPipeline:
         else:
             terminal_attempt = min(attempts, key=candidate_sort_key) if attempts else {}
             terminal_status = str(terminal_attempt.get("status") or "invalid")
-            if terminal_status not in STATUS_RANK:
+            if terminal_status not in {
+                "plausible", "cleanfix", "noisefix", "nonefix", "negfix", "invalid",
+            }:
                 terminal_status = "invalid"
             terminal_error = str(
                 terminal_attempt.get("validation_error")
@@ -329,6 +413,8 @@ class DebuggingPipeline:
                 "attempts": attempts,
                 "fault_localization": self._fault_localization(payloads),
             }
+        if direct_workspace is not None:
+            direct_workspace.close()
         return self._finish(project_results, manifest, result)
 
     @staticmethod
@@ -340,6 +426,9 @@ class DebuggingPipeline:
         usage small and makes the input explicit and reproducible for every attempt.
         """
         if not baseline:
+            return
+        if hasattr(workspace, "write_baseline_context"):
+            workspace.write_baseline_context(str(baseline.get("execution_output") or ""))
             return
         context_dir = workspace.path / ".debugging-framework"
         if context_dir.exists() and context_dir.is_symlink():
@@ -362,6 +451,8 @@ class DebuggingPipeline:
             "selected_functions": candidate.get("selected_functions", []),
             "patch_diff_artifact": candidate.get("patch_diff_artifact", ""),
             "llm_patch_artifact": candidate.get("llm_patch_artifact", ""),
+            "normalized_patch_artifact": candidate.get("normalized_patch_artifact", ""),
+            "diff_normalization_actions": candidate.get("diff_normalization_actions", []),
             "codex_response_artifact": candidate.get("codex_response_artifact", ""),
             "codex_events_artifact": candidate.get("codex_events_artifact", ""),
             "codex_stderr_artifact": candidate.get("codex_stderr_artifact", ""),
@@ -380,6 +471,8 @@ class DebuggingPipeline:
                     "patch_paths",
                     "failed_test_ids", "passed_test_ids", "test_id_granularity",
                     "target_tests", "target_commands", "target_status", "target_passed",
+                    "post_validation_status", "initial_failed_test_ids", "post_failed_test_ids",
+                    "fixed_test_ids", "regression_test_ids", "classification_basis_valid",
                     "baseline_reproduced", "environment", "environment_digest", "plan_digest",
                     "environment_backend", "provisioned_image", "provisioned_image_digest",
                     "provisioned_container",

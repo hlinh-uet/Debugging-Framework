@@ -62,6 +62,8 @@ class OCIEnvironment:
         if not spec.base_image:
             raise RuntimeError(f"environment_base_image_unknown:{spec.system}")
         artifact_dir.mkdir(parents=True, exist_ok=True)
+        if spec.backend == "image":
+            return self._use_prebuilt_image(spec, artifact_dir)
         tag = "debugging-framework/" + spec.digest.split(":", 1)[-1][:24]
         existing = subprocess.run(
             [self.runtime, "image", "inspect", "--format", "{{.Id}}", tag],
@@ -137,6 +139,42 @@ class OCIEnvironment:
         if inspect.returncode != 0 or not image_digest:
             raise RuntimeError("environment_image_digest_unavailable")
         return OCIProvision(self.runtime, tag, spec.digest, command, output, image_digest)
+
+    def _use_prebuilt_image(
+        self,
+        spec: EnvironmentSpec,
+        artifact_dir: Path,
+    ) -> OCIProvision:
+        """Resolve a caller-prepared image without building or pulling anything."""
+        image = spec.base_image.strip()
+        command = [self.runtime, "image", "inspect", "--format", "{{.Id}}", image]
+        inspected = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            check=False,
+        )
+        image_digest = (inspected.stdout or "").strip()
+        if inspected.returncode != 0 or not image_digest:
+            detail = image_digest.splitlines()
+            raise RuntimeError(
+                "environment_prebuilt_image_unavailable:"
+                + (detail[-1] if detail else image)
+            )
+        output = f"Using caller-prepared OCI image {image} ({image_digest})\n"
+        (artifact_dir / "provision.log").write_text(output, encoding="utf-8")
+        return OCIProvision(
+            self.runtime,
+            image,
+            spec.digest,
+            command,
+            output,
+            image_digest,
+        )
 
     def command(
         self,

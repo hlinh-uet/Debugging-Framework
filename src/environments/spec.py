@@ -98,7 +98,14 @@ class EnvironmentResolver:
         "rust-toolchain.toml", ".tool-versions", "global.json", ".java-version",
     }
 
-    def resolve(self, root: Path, system: str, *, backend: str = "local") -> EnvironmentSpec:
+    def resolve(
+        self,
+        root: Path,
+        system: str,
+        *,
+        backend: str = "current",
+        image: str = "",
+    ) -> EnvironmentSpec:
         root = root.resolve()
         manifests = sorted(
             path.name for path in root.iterdir() if path.is_file() and path.name in self._MANIFESTS
@@ -128,6 +135,8 @@ class EnvironmentResolver:
         base_image = (
             "running-container"
             if backend == "container"
+            else image.strip()
+            if backend == "image"
             else self._base_image(system, root, runtime_hints)
         )
         # A project-provided devcontainer/Dockerfile is evidence for discovery;

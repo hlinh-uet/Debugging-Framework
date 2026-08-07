@@ -6,12 +6,12 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import replace
 from pathlib import Path
 
 from src.core.pipeline import (
     DebuggingPipeline,
     PipelineOptions,
+    classify_validation_result,
 )
 from src.loaders.defects4c import Defects4CProjectResolver
 from src.loaders.project import ProjectLoader
@@ -30,9 +30,10 @@ def build_parser(config: FrameworkConfig | None = None) -> argparse.ArgumentPars
     parser.add_argument("--results-dir", type=Path, default=config.results_dir)
     parser.add_argument("--codex-bin", default=config.codex_executable)
     parser.add_argument(
-        "--environment-backend", choices=("local", "container", "oci", "auto"),
+        "--environment-backend",
+        choices=("current", "local", "image", "container", "oci", "auto"),
         default=config.environment_backend,
-        help="Environment backend: running container, local Bubblewrap, OCI image, or auto.",
+        help="Prepared current env, prebuilt image, running container, OCI, or auto.",
     )
     parser.add_argument(
         "--environment-runtime", default=config.environment_runtime,
@@ -41,6 +42,10 @@ def build_parser(config: FrameworkConfig | None = None) -> argparse.ArgumentPars
     parser.add_argument(
         "--environment-container", default=config.environment_container,
         help="Running Docker container name; defaults to DEFECTS4C_CONTAINER or convention.",
+    )
+    parser.add_argument(
+        "--environment-image", default=config.environment_image,
+        help="Prebuilt OCI image name/digest used with backend image.",
     )
     add_defects4c_options(parser, config=config)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -55,39 +60,26 @@ def build_parser(config: FrameworkConfig | None = None) -> argparse.ArgumentPars
     inspect_parser.add_argument("--json", action="store_true")
     add_environment_options(inspect_parser)
 
-    run_parser = sub.add_parser(
-        "run", help="Project -> Codex FL/APR -> raw patch -> validation result."
+    repair_parser = sub.add_parser(
+        "repair",
+        help="FL/APR trực tiếp trên project hiện tại từ failure evidence đã cung cấp.",
     )
-    run_parser.add_argument(
+    repair_parser.add_argument(
         "project", type=Path, nargs="?",
-        help="Project root; optional with --libyang/--fmt/--defects4c.",
+        help="Project root; mặc định là thư mục hiện tại.",
     )
-    run_parser.add_argument(
-        "--failing-test", dest="failing_tests", action="append",
-        help="Tên/ID test đang fail; có thể lặp option. Defects4C alias tự đọc metadata nếu bỏ qua.",
+    repair_parser.add_argument(
+        "--failing-test", "--test-id", dest="failing_tests", action="append",
+        help="Tên/ID test đã fail; có thể lặp option.",
     )
-    run_parser.add_argument("--output", type=Path, help="File patch output.")
-    add_environment_options(run_parser)
-    add_run_options(run_parser, config)
-
-    batch_parser = sub.add_parser(
-        "run-batch", help="Chạy tuần tự mọi project path trong materialization manifest."
+    repair_parser.add_argument(
+        "--failing-output", "--failure-output", "--baseline-output",
+        dest="failing_output", type=Path, required=True,
+        help="Actual failing-test output; '-' đọc stdin. Không chạy lại baseline.",
     )
-    batch_parser.add_argument(
-        "manifest", type=Path, nargs="?",
-        help="Materialized manifest; optional with --libyang/--fmt to resolve all bugs.",
-    )
-    batch_parser.add_argument(
-        "--output-dir", type=Path,
-        help="Thư mục patch output; mặc định dùng results/<project>/patch.diff.",
-    )
-    add_environment_options(batch_parser)
-    add_defects4c_options(batch_parser, subcommand=True)
-    batch_parser.add_argument(
-        "--failing-test", dest="default_failing_tests", action="append",
-        help="Test fail dùng mặc định cho record không có failing_tests; có thể lặp option.",
-    )
-    add_run_options(batch_parser, config)
+    repair_parser.add_argument("--output", type=Path, help="File patch output.")
+    add_environment_options(repair_parser)
+    add_repair_options(repair_parser, config, workspace_default="current")
 
     validate_parser = sub.add_parser("validate", help="Build/test lại một unified diff trên project.")
     validate_parser.add_argument("project", type=Path)
@@ -110,7 +102,7 @@ def build_parser(config: FrameworkConfig | None = None) -> argparse.ArgumentPars
     doctor_parser.add_argument("--jobs", type=int, default=config.jobs)
     add_environment_options(doctor_parser)
     add_defects4c_options(inspect_parser, subcommand=True)
-    add_defects4c_options(run_parser, subcommand=True)
+    add_defects4c_options(repair_parser, subcommand=True)
     add_defects4c_options(doctor_parser, subcommand=True)
     return parser
 
@@ -119,9 +111,10 @@ def add_environment_options(parser: argparse.ArgumentParser) -> None:
     # SUPPRESS lets a value written after the subcommand override the global
     # option without replacing the global default when it is omitted.
     parser.add_argument(
-        "--environment-backend", choices=("local", "container", "oci", "auto"),
+        "--environment-backend",
+        choices=("current", "local", "image", "container", "oci", "auto"),
         default=argparse.SUPPRESS,
-        help="Environment backend: running container, local Bubblewrap, OCI image, or auto.",
+        help="Prepared current env, prebuilt image, running container, OCI, or auto.",
     )
     parser.add_argument(
         "--environment-runtime", default=argparse.SUPPRESS,
@@ -130,6 +123,10 @@ def add_environment_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--environment-container", default=argparse.SUPPRESS,
         help="Running Docker container name; defaults to DEFECTS4C_CONTAINER or convention.",
+    )
+    parser.add_argument(
+        "--environment-image", default=argparse.SUPPRESS,
+        help="Prebuilt OCI image name/digest used with backend image.",
     )
 
 
@@ -163,7 +160,12 @@ def add_defects4c_options(
     )
 
 
-def add_run_options(parser: argparse.ArgumentParser, config: FrameworkConfig) -> None:
+def add_repair_options(
+    parser: argparse.ArgumentParser,
+    config: FrameworkConfig,
+    *,
+    workspace_default: str | None = None,
+) -> None:
     parser.add_argument("--attempts", type=int, default=config.attempts)
     parser.add_argument("--model", default=config.model)
     parser.add_argument("--codex-timeout", type=int, default=config.codex_timeout_seconds)
@@ -172,6 +174,11 @@ def add_run_options(parser: argparse.ArgumentParser, config: FrameworkConfig) ->
     parser.add_argument(
         "--inherit-codex-config", action=argparse.BooleanOptionalAction,
         default=config.inherit_codex_config,
+    )
+    parser.add_argument(
+        "--codex-workspace", choices=("auto", "snapshot", "current"),
+        default=workspace_default or config.codex_workspace,
+        help="Codex workspace; repair mặc định sửa trực tiếp project hiện tại.",
     )
 
 
@@ -184,10 +191,13 @@ def _prepare_defects4c_input(
     config: FrameworkConfig,
     raw_argv: list[str],
 ) -> None:
-    if args.command not in {"run", "inspect", "doctor"}:
+    if args.command not in {"repair", "inspect", "doctor"}:
         return
     alias = str(getattr(args, "defects4c_alias", "") or "").strip()
     project_path = getattr(args, "project", None)
+    if not alias and project_path is None and args.command in {"repair", "inspect", "doctor"}:
+        args.project = Path.cwd()
+        return
     if not alias and project_path is None:
         raise ValueError(
             "Cần project path hoặc alias Defects4C (--libyang, --fmt, --defects4c <name>)"
@@ -202,7 +212,7 @@ def _prepare_defects4c_input(
     )
     args.project = selection.project.path
     args.defects4c_selection = selection
-    if args.command == "run" and not normalize_failing_tests(
+    if args.command == "repair" and not normalize_failing_tests(
         getattr(args, "failing_tests", None)
     ):
         args.failing_tests = list(selection.failing_tests)
@@ -219,12 +229,6 @@ def main(argv: list[str] | None = None) -> int:
         config = FrameworkConfig.load()
         raw_argv = list(argv if argv is not None else sys.argv[1:])
         args = build_parser(config).parse_args(raw_argv)
-        args._environment_container_explicit = _option_supplied(
-            raw_argv, "--environment-container"
-        )
-        args._environment_backend_explicit = _option_supplied(
-            raw_argv, "--environment-backend"
-        )
         _prepare_defects4c_input(args, config, raw_argv)
         settings = Settings(
             results_dir=args.results_dir,
@@ -237,11 +241,9 @@ def main(argv: list[str] | None = None) -> int:
             environment_backend=args.environment_backend,
             environment_runtime=args.environment_runtime,
             environment_container=args.environment_container,
+            environment_image=args.environment_image,
             defects4c_root=getattr(args, "defects4c_root", config.defects4c_root),
         ).validated()
-        if args.command == "run-batch":
-            return run_batch(settings, config, args)
-
         project = ProjectLoader().load(args.project)
 
         if args.command == "inspect":
@@ -249,6 +251,10 @@ def main(argv: list[str] | None = None) -> int:
                 environment_backend=getattr(settings, "environment_backend", "auto"),
                 environment_runtime=getattr(settings, "environment_runtime", "auto"),
                 environment_container=getattr(settings, "environment_container", ""),
+                environment_image=getattr(settings, "environment_image", ""),
+                prepared_environment=getattr(settings, "environment_backend", "") in {
+                    "current", "image",
+                },
             )
             plan = validator.inspect(project)
             environment = validator.resolve_environment(project, plan)
@@ -265,10 +271,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "doctor":
             return doctor(settings, project, args.jobs)
 
-        if args.command == "run":
-            validate_run_arguments(config, settings, args)
-            result = run_one_project(
-                settings, project, args, args.output, args.failing_tests
+        if args.command == "repair":
+            validate_repair_arguments(config, settings, args)
+            external_output = read_failure_output(args.failing_output)
+            result = repair_project(
+                settings,
+                project,
+                args,
+                args.output,
+                args.failing_tests,
+                external_baseline_output=external_output,
             )
             print(json.dumps({
                 "status": result.get("status"),
@@ -304,20 +316,43 @@ def normalize_failing_tests(value) -> tuple[str, ...]:
     return normalized
 
 
-def validate_run_arguments(config: FrameworkConfig, settings: Settings, args) -> None:
+def validate_repair_arguments(config: FrameworkConfig, settings: Settings, args) -> None:
     if config.require_api_key and not settings.codex_api_key:
         raise ValueError("CODEX_API_KEY chưa được cấu hình")
     if args.attempts < 1 or args.codex_timeout < 1 or args.command_timeout < 1:
         raise ValueError("attempts/timeout phải >= 1")
     if args.jobs < 0:
         raise ValueError("--jobs phải >= 0")
-    if hasattr(args, "failing_tests") and not normalize_failing_tests(args.failing_tests):
+    if not normalize_failing_tests(args.failing_tests):
         raise ValueError("cần ít nhất một --failing-test")
+    if args.failing_output is None:
+        raise ValueError("repair cần --failure-output")
 
 
-def run_one_project(
+def read_failure_output(value: Path | str | None) -> str | None:
+    if value is None:
+        return None
+    raw = str(value)
+    if raw == "-":
+        output = sys.stdin.read()
+    else:
+        path = Path(raw).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Failing-test output không tồn tại: {path}")
+        try:
+            output = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise RuntimeError(f"Không đọc được failing-test output {path}: {exc}") from exc
+    if not output.strip():
+        raise ValueError("Failing-test output không được rỗng")
+    return output
+
+
+def repair_project(
     settings: Settings, project, args, output_patch: Path | None,
     failing_tests: list[str] | tuple[str, ...] | None = None,
+    *,
+    external_baseline_output: str | None = None,
 ) -> dict:
     validator = ProjectValidator(
         command_timeout=args.command_timeout,
@@ -325,6 +360,8 @@ def run_one_project(
         environment_backend=getattr(settings, "environment_backend", "auto"),
         environment_runtime=getattr(settings, "environment_runtime", "auto"),
         environment_container=getattr(settings, "environment_container", ""),
+        environment_image=getattr(settings, "environment_image", ""),
+        prepared_environment=True,
     )
     pipeline = DebuggingPipeline(settings=settings, validator=validator)
     return pipeline.run(
@@ -335,121 +372,11 @@ def run_one_project(
             codex_timeout_seconds=args.codex_timeout,
             inherit_codex_config=args.inherit_codex_config,
             failing_tests=tuple(normalize_failing_tests(failing_tests or ())),
+            external_baseline_output=external_baseline_output,
+            workspace_mode=getattr(args, "codex_workspace", "auto"),
         ),
         output_patch=output_patch,
     )
-
-
-def run_batch(settings: Settings, config: FrameworkConfig, args) -> int:
-    validate_run_arguments(config, settings, args)
-    alias = str(getattr(args, "defects4c_alias", "") or "").strip()
-    if alias:
-        if args.manifest is not None:
-            raise ValueError("Không dùng đồng thời manifest và --defects4c alias")
-        resolver = Defects4CProjectResolver(
-            getattr(settings, "defects4c_root", None)
-        )
-        selections = resolver.resolve_all(
-            alias,
-            bug_id=str(getattr(args, "bug_id", "") or ""),
-        )
-        recipe = selections[0].recipe
-        if not getattr(args, "_environment_container_explicit", False):
-            settings = replace(settings, environment_container=recipe.container)
-        if not getattr(args, "_environment_backend_explicit", False):
-            settings = replace(settings, environment_backend="container")
-        records = [
-            {
-                "project_path": str(selection.project.path),
-                "project_name": selection.recipe.project_name,
-                "bug_id": selection.bug_id,
-                "failing_tests": list(selection.failing_tests),
-            }
-            for selection in selections
-        ]
-    else:
-        if args.manifest is None:
-            raise ValueError(
-                "run-batch cần manifest hoặc Defects4C alias (--libyang/--fmt)"
-            )
-        records = load_batch_manifest(args.manifest)
-    loader = ProjectLoader()
-    output_dir = args.output_dir.expanduser().resolve() if args.output_dir else None
-    default_failing_tests = normalize_failing_tests(
-        getattr(args, "default_failing_tests", None) or ()
-    )
-    results = []
-    for index, record in enumerate(records, start=1):
-        project = loader.load(Path(record["project_path"]))
-        print(f"[batch {index}/{len(records)}] {project.path}")
-        output = output_dir / f"{safe_name(project.project_id, 180)}.patch" if output_dir else None
-        failing_tests = record.get("failing_tests") or default_failing_tests
-        if not failing_tests:
-            raise ValueError(
-                f"Batch record {index} thiếu failing_tests; thêm field này hoặc --failing-test"
-            )
-        result = run_one_project(settings, project, args, output, failing_tests)
-        results.append(
-            {
-                "project": str(project.path),
-                "bug_id": record.get("bug_id", ""),
-                "failing_tests": failing_tests,
-                "status": result.get("status"),
-                "output_patch": result.get("output_patch", ""),
-                "patch_validation_passed": result.get("patch_validation_passed", False),
-                "llm_patch_artifact": result.get("llm_patch_artifact", ""),
-                "validation_error": result.get("validation_error", ""),
-            }
-        )
-    summary = {
-        "manifest": (
-            str(args.manifest.expanduser().resolve())
-            if args.manifest is not None else ""
-        ),
-        "defects4c": alias,
-        "project_count": len(results),
-        "plausible_count": sum(item["status"] == "plausible" for item in results),
-        "outcome_counts": {
-            outcome: sum(item["status"] == outcome for item in results)
-            for outcome in ("plausible", "failing", "invalid", "llm_failed")
-        },
-        "results": results,
-    }
-    settings.results_dir.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(settings.results_dir / "batch_result.json", summary)
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
-    return 0 if summary["plausible_count"] == len(results) else 1
-
-
-def load_batch_manifest(path: Path) -> list[dict]:
-    path = path.expanduser().resolve()
-    if not path.is_file():
-        raise FileNotFoundError(f"Batch manifest không tồn tại: {path}")
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Batch manifest không hợp lệ {path}: {exc}") from exc
-    records = payload.get("projects") if isinstance(payload, dict) else None
-    if not isinstance(records, list) or not records:
-        raise ValueError(f"Batch manifest không có projects: {path}")
-    normalized = []
-    for index, record in enumerate(records, start=1):
-        if not isinstance(record, dict) or not str(record.get("project_path") or "").strip():
-            raise ValueError(f"Batch manifest projects[{index}] thiếu project_path")
-        project_path = Path(str(record["project_path"])).expanduser()
-        if not project_path.is_absolute():
-            project_path = path.parent / project_path
-        failing_tests = normalize_failing_tests(
-            record.get("failing_tests", record.get("failing_test"))
-        )
-        normalized.append(
-            {
-                **record,
-                "project_path": str(project_path.resolve()),
-                "failing_tests": list(failing_tests),
-            }
-        )
-    return normalized
 
 
 def validate_patch(
@@ -479,6 +406,8 @@ def validate_patch(
         environment_backend=getattr(settings, "environment_backend", "auto"),
         environment_runtime=getattr(settings, "environment_runtime", "auto"),
         environment_container=getattr(settings, "environment_container", ""),
+        environment_image=getattr(settings, "environment_image", ""),
+        prepared_environment=True,
     )
     baseline = None
     if failing_tests:
@@ -508,6 +437,7 @@ def validate_patch(
         expected_image_digest=(baseline or {}).get("provisioned_image_digest", ""),
     )
     if baseline is not None:
+        result = classify_validation_result(baseline, result)
         result["baseline"] = baseline
     atomic_write_json(artifact_dir / "result.json", result)
     print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -521,6 +451,8 @@ def doctor(settings: Settings, project, jobs: int) -> int:
         environment_backend=getattr(settings, "environment_backend", "auto"),
         environment_runtime=getattr(settings, "environment_runtime", "auto"),
         environment_container=getattr(settings, "environment_container", ""),
+        environment_image=getattr(settings, "environment_image", ""),
+        prepared_environment=True,
     )
     if validator.environment_backend == "container":
         container = validator.environment_container.resolve_container(project.project_id)
@@ -532,6 +464,17 @@ def doctor(settings: Settings, project, jobs: int) -> int:
                 "[FAIL] Không tìm thấy container Defects4C đang chạy; "
                 "đặt DEFECTS4C_CONTAINER hoặc khởi my_defects4c_<project>"
             )
+    elif validator.environment_backend == "image":
+        if validator.environment_runtime.available:
+            print(
+                f"[OK] Prebuilt OCI image: {validator.environment_image} "
+                f"(runtime={validator.environment_runtime.runtime})"
+            )
+        else:
+            failures += 1
+            print("[FAIL] OCI runtime không khả dụng cho prebuilt image")
+    elif validator.environment_backend == "current":
+        print("[OK] Dùng current environment do caller chuẩn bị")
     elif validator.environment_backend == "auto" and validator.environment_container.resolve_container(
         project.project_id
     ):
@@ -568,8 +511,14 @@ def doctor(settings: Settings, project, jobs: int) -> int:
         print(f"[OK] Build system: {plan.system}")
         print(f"[OK] Environment backend: {environment.backend}")
         print(f"[OK] Environment digest: {environment.digest}")
-        oci_backend = environment.backend == "oci"
-        for command in (*plan.setup, *plan.build, *plan.test):
+        oci_backend = environment.backend in {"image", "oci", "container"}
+        for command in (
+            *plan.setup,
+            *plan.build,
+            *plan.target_test,
+            *plan.regression_test,
+            *plan.test,
+        ):
             if oci_backend:
                 print(f"[AUTO] {command.label}: sẽ chạy trong {environment.base_image}")
                 continue
@@ -624,8 +573,8 @@ def _print_plan(project: Path, plan: dict, environment: dict | None = None) -> N
     if environment:
         print(f"environment_backend: {environment['backend']}")
         print(f"environment_digest: {environment['digest']}")
-    for phase in ("setup", "build", "test"):
-        for item in plan[phase]:
+    for phase in ("setup", "build", "target_test", "regression_test", "test"):
+        for item in plan.get(phase, []):
             print(f"{phase}: (cwd={item['cwd']}) {' '.join(item['argv'])}")
 
 

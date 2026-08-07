@@ -24,8 +24,9 @@ KNOWN_ENV_KEYS = {
     "DEBUGGING_CODEX_MODEL", "DEBUGGING_CODEX_BIN", "DEBUGGING_ATTEMPTS",
     "DEBUGGING_TIMEOUT", "DEBUGGING_COMMAND_TIMEOUT", "DEBUGGING_JOBS",
     "DEBUGGING_INHERIT_CODEX_CONFIG", "DEBUGGING_RESULTS_DIR",
+    "DEBUGGING_CODEX_WORKSPACE",
     "DEBUGGING_ENVIRONMENT_BACKEND", "DEBUGGING_ENVIRONMENT_RUNTIME",
-    "DEBUGGING_ENVIRONMENT_CONTAINER",
+    "DEBUGGING_ENVIRONMENT_CONTAINER", "DEBUGGING_ENVIRONMENT_IMAGE",
     "DEBUGGING_DEFECTS4C_ROOT",
     "DEBUGGING_DATASET", "DEBUGGING_BUG_IDS", "DEBUGGING_INCLUDE_FIXED_FAIL_TESTS",
     "DEBUGGING_ONLY_MISSING", "DEBUGGING_EVALUATE", "DEBUGGING_UNIFIED_ROOT",
@@ -125,9 +126,11 @@ class FrameworkConfig:
     command_timeout_seconds: int = 1800
     jobs: int = 0
     inherit_codex_config: bool = False
-    environment_backend: str = "container"
+    codex_workspace: str = "auto"
+    environment_backend: str = "current"
     environment_runtime: str = "auto"
     environment_container: str = ""
+    environment_image: str = ""
     defects4c_root: Path = DEFAULT_DEFECTS4C_ROOT
 
     @classmethod
@@ -141,6 +144,11 @@ class FrameworkConfig:
             return _value(name, files, active, default)
 
         timeout = get("DEBUGGING_TIMEOUT", "1800")
+        codex_workspace = get("DEBUGGING_CODEX_WORKSPACE", "auto")
+        if codex_workspace not in {"auto", "snapshot", "current"}:
+            raise ValueError(
+                "DEBUGGING_CODEX_WORKSPACE phải là auto, snapshot hoặc current"
+            )
         return cls(
             env_file=path.expanduser().resolve(),
             results_dir=_path(get("DEBUGGING_RESULTS_DIR"), DEFAULT_RESULTS_DIR),
@@ -161,12 +169,14 @@ class FrameworkConfig:
             inherit_codex_config=_bool(
                 "DEBUGGING_INHERIT_CODEX_CONFIG", get("DEBUGGING_INHERIT_CODEX_CONFIG", "false")
             ),
-            environment_backend=get("DEBUGGING_ENVIRONMENT_BACKEND", "container"),
+            codex_workspace=codex_workspace,
+            environment_backend=get("DEBUGGING_ENVIRONMENT_BACKEND", "current"),
             environment_runtime=get("DEBUGGING_ENVIRONMENT_RUNTIME", "auto"),
             environment_container=(
                 get("DEBUGGING_ENVIRONMENT_CONTAINER", "")
                 or get("DEFECTS4C_CONTAINER", "")
             ),
+            environment_image=get("DEBUGGING_ENVIRONMENT_IMAGE", ""),
             defects4c_root=_path(
                 get("DEBUGGING_DEFECTS4C_ROOT"), DEFAULT_DEFECTS4C_ROOT
             ),
@@ -182,9 +192,10 @@ class Settings:
     codex_base_url: str = ""
     codex_wire_api: str = "responses"
     codex_env_key: str = "CODEX_API_KEY"
-    environment_backend: str = "container"
+    environment_backend: str = "current"
     environment_runtime: str = "auto"
     environment_container: str = ""
+    environment_image: str = ""
     defects4c_root: Path = DEFAULT_DEFECTS4C_ROOT
 
     @property
@@ -194,9 +205,16 @@ class Settings:
     def validated(self) -> "Settings":
         if not self.output_schema.is_file():
             raise FileNotFoundError(f"Thiếu Codex output schema: {self.output_schema}")
-        if self.environment_backend not in {"local", "oci", "container", "auto"}:
+        if self.environment_backend not in {
+            "current", "local", "image", "oci", "container", "auto",
+        }:
             raise ValueError(
-                "DEBUGGING_ENVIRONMENT_BACKEND phải là local, oci, container hoặc auto"
+                "DEBUGGING_ENVIRONMENT_BACKEND phải là current, local, image, "
+                "oci, container hoặc auto"
+            )
+        if self.environment_backend == "image" and not self.environment_image.strip():
+            raise ValueError(
+                "DEBUGGING_ENVIRONMENT_IMAGE/--environment-image là bắt buộc với backend image"
             )
         return Settings(
             results_dir=self.results_dir.expanduser().resolve(),
@@ -209,5 +227,6 @@ class Settings:
             environment_backend=self.environment_backend,
             environment_runtime=self.environment_runtime,
             environment_container=self.environment_container,
+            environment_image=self.environment_image.strip(),
             defects4c_root=self.defects4c_root.expanduser().resolve(),
         )

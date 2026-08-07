@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 
 [project.scripts]
-debugging-framework = "src.cli:main"
+debugging-framework = "debugging_framework.cli:main"
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
@@ -20,9 +20,11 @@ src = ["schemas/*.json"]
 
 [tool.setuptools]
 packages = [
+  "debugging_framework",
   "src",
   "src.core",
   "src.loaders",
+  "src.schemas",
   "src.utils",
   "src.validation",
   "src.environments",

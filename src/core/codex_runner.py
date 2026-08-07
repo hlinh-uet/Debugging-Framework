@@ -21,7 +21,7 @@ class CodexRunResult:
 
 
 class CodexRunner:
-    """Invoke `codex exec` as a bounded worker in a disposable writable copy."""
+    """Invoke ``codex exec`` as a bounded worker in a supplied writable workspace."""
 
     def __init__(
         self,

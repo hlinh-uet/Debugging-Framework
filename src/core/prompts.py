@@ -18,15 +18,26 @@ def build_codex_prompt(
     failing_tests: list[str] | tuple[str, ...] | None = None,
     previous_attempt: Optional[dict] = None,
     baseline: Optional[dict] = None,
+    workspace_mode: str = "snapshot",
 ) -> str:
     failing_tests = tuple(
         str(value).strip() for value in (failing_tests or ()) if str(value).strip()
     )
     known_failure = (
         (
-            "The framework has already run these failing test(s). Read the complete "
-            "baseline output file named below and use it as the primary FL/APR signal; do not "
-            "rerun them unless a focused rerun is necessary:\n"
+            (
+                (
+                    "The caller supplied the output for these failing test(s). Read the complete "
+                    if baseline and baseline.get("baseline_external")
+                    else "The framework has already run these failing test(s). Read the complete "
+                )
+                + "baseline output file named below and use it as the primary FL/APR signal; "
+                + (
+                    "do not rerun them:\n"
+                    if baseline and baseline.get("baseline_external")
+                    else "do not rerun them unless a focused rerun is necessary:\n"
+                )
+            )
             if baseline
             else
             "The caller has identified these failing test(s). Start by running and "
@@ -44,18 +55,32 @@ def build_codex_prompt(
         )
     baseline_context = ""
     if baseline:
-        baseline_context = (
-            "\nThe framework has already provisioned the environment and reproduced the "
+        source_intro = (
+            "The caller supplied the failing-test output before this attempt. Treat it "
+            "as authoritative baseline evidence; do not rerun the test."
+            if baseline.get("baseline_external")
+            else
+            "The framework has already provisioned the environment and reproduced the "
             "requested failure before this attempt. Treat this as authoritative baseline "
-            "evidence; do not change the validation contract or spend time guessing a "
-            "different environment. The complete raw setup/build/test output is available "
+            "evidence;"
+        )
+        output_description = (
+            "complete supplied failing-test output"
+            if baseline.get("baseline_external")
+            else "complete raw setup/build/test output"
+        )
+        baseline_context = (
+            "\n" + source_intro + " Do not change the validation contract or spend time guessing a "
+            f"different environment. The {output_description} is available "
             "in `.debugging-framework/baseline-output.txt`; read that file before making "
             "diagnostic assumptions. A concise failure excerpt and its audit artifact are "
             "included below.\n"
             + _clip(json.dumps({
                 "target_tests": baseline.get("target_tests", failing_tests),
                 "failed_test_ids": baseline.get("failed_test_ids", []),
-                "failure_output": baseline.get("failure_output", ""),
+                # Keep the prompt bounded; the complete output is available in
+                # the workspace file named immediately above.
+                "failure_output": _clip(baseline.get("failure_output", ""), 12_000),
                 "baseline_output_file": baseline.get(
                     "codex_snapshot_output_file",
                     ".debugging-framework/baseline-output.txt",
@@ -66,11 +91,16 @@ def build_codex_prompt(
                 "environment": baseline.get("environment", {}),
                 "plan_digest": baseline.get("plan_digest", ""),
                 "environment_digest": baseline.get("environment_digest", ""),
-            }, ensure_ascii=False, indent=2), 120_000)
+            }, ensure_ascii=False, indent=2), 24_000)
         )
     workflow_context = (
-        "The framework has already provisioned the environment and selected the "
-        "validation workflow; focus on FL/APR and use the supplied baseline."
+        (
+            "The caller supplied the failing-test output and the framework selected the "
+            "validation workflow; focus on FL/APR and use that supplied baseline."
+            if baseline and baseline.get("baseline_external")
+            else "The framework has already provisioned the environment and selected the "
+            "validation workflow; focus on FL/APR and use the supplied baseline."
+        )
         if baseline
         else
         "The framework has already copied the project here but has not installed, "
@@ -78,7 +108,7 @@ def build_codex_prompt(
         "environment setup."
     )
     investigation_context = (
-        "Read `.debugging-framework/baseline-output.txt` (the complete baseline output), "
+        "Read `.debugging-framework/baseline-output.txt` (the complete supplied baseline output), "
         "inspect the relevant production source and test layout, then investigate the "
         "root cause and implement the repair. Do not rerun setup or the failing test "
         "unless necessary."
@@ -90,10 +120,15 @@ def build_codex_prompt(
         "reproduce its failing tests."
     )
 
+    workspace_description = (
+        "This is the supplied project workspace. Codex may edit it directly; keep the "
+        "repair focused on the requested source files and do not remove unrelated user changes."
+        if workspace_mode == "current"
+        else "This is a disposable, writable snapshot of the input project. The framework has already "
+        "copied the entire project, including source, tests, manifests, lockfiles and documentation."
+    )
     return f"""You are a software engineer performing fault localization and program repair.
-This is a disposable, writable snapshot of the input project. The framework has already
-copied the entire project here, including source, tests, manifests, lockfiles and
-documentation. {workflow_context}
+{workspace_description} {workflow_context}
 The framework will extract your patch and independently validate it on fresh copies.
 
 {investigation_context}
@@ -113,6 +148,7 @@ Constraints:
 - `repair.paths` must list every intentionally changed repository-relative file.
 - `repair.diff` must be a raw unified/Git diff beginning with `diff --git a/...`
   or `--- a/<path>`, contain all intentional changes, and have no Markdown fence.
+- Do not wrap the diff in prose, Markdown fences, or `*** Begin Patch`/`*** End Patch` markers.
 - Return only valid JSON matching the supplied schema. Do not claim that tests passed.
 
 Fault-localization entries must contain path, function/symbol, score in [0,1], and
@@ -125,6 +161,6 @@ Run context:
 
 {baseline_context}
 
-Inspect the project, implement and test the repair in this temporary workspace, review
+Inspect the project, implement and test the repair in this workspace, review
 the final diff, then return JSON with exactly `summary`, `fault_localization`, and `repair`.
 """
