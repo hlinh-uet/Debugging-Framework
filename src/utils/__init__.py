@@ -1,2 +1,1 @@
-"""Shared filesystem, configuration, and compatibility utilities."""
-
+"""Shared filesystem and configuration utilities."""

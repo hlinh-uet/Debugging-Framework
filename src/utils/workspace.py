@@ -6,7 +6,6 @@ import shutil
 import subprocess
 import tempfile
 import uuid
-from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 from src.utils.jsonio import safe_name
@@ -16,12 +15,14 @@ class WorkspaceError(RuntimeError):
     pass
 
 
-SOURCE_EXTENSIONS = {
+# The partner-facing repair contract targets C/C++. Keeping the automatic
+# patch allowlist deliberately narrow prevents an APR candidate from making its
+# own oracle pass by changing a Makefile, CMake configuration, Dockerfile,
+# custom test runner, or another executable validation artifact.  Projects
+# that genuinely need a build/test-infrastructure repair require a separate,
+# explicitly reviewed workflow rather than the automatic ``plausible`` path.
+C_CPP_PRODUCTION_EXTENSIONS = {
     ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".inc",
-    ".py", ".pyi", ".java", ".kt", ".kts", ".scala", ".go", ".rs", ".swift",
-    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".rb", ".php", ".cs", ".fs",
-    ".ex", ".exs", ".erl", ".hrl", ".lua", ".r", ".dart", ".sh", ".m", ".mm",
-    ".vue", ".svelte", ".sol", ".clj", ".cljs", ".hs", ".lhs",
 }
 
 TEST_PATH_COMPONENTS = {
@@ -170,7 +171,7 @@ def _normalize_hunk_counts(lines: list[str]) -> bool:
 def is_production_source_path(value: object) -> bool:
     """Accept source files while rejecting tests and generated/build outputs."""
     relpath = normalize_relpath(value)
-    if not relpath or Path(relpath).suffix.lower() not in SOURCE_EXTENSIONS:
+    if not relpath or Path(relpath).suffix.lower() not in C_CPP_PRODUCTION_EXTENSIONS:
         return False
     parts = [part.lower() for part in PurePosixPath(relpath).parts]
     if any(part in TEST_PATH_COMPONENTS | GENERATED_PATH_COMPONENTS for part in parts[:-1]):
@@ -182,6 +183,25 @@ def is_production_source_path(value: object) -> bool:
         or ".test." in parts[-1]
         or ".spec." in parts[-1]
     )
+
+
+def non_repairable_patch_paths(values: list[str] | tuple[str, ...]) -> list[str]:
+    """Return paths that may change the validation oracle or are not C/C++ source.
+
+    This is an enforcement boundary, not a prompt hint.  A path must be a
+    production C/C++ source/header according to both the repository path policy
+    and the extension allowlist before its patch can be classified plausible.
+    """
+    blocked: list[str] = []
+    for value in values:
+        relpath = normalize_relpath(value)
+        if (
+            not relpath
+            or Path(relpath).suffix.lower() not in C_CPP_PRODUCTION_EXTENSIONS
+            or not is_production_source_path(relpath)
+        ):
+            blocked.append(relpath or str(value))
+    return sorted(dict.fromkeys(blocked))
 
 
 class ProjectWorkspace:
@@ -352,208 +372,6 @@ class ProjectWorkspace:
             raise WorkspaceError(
                 f"git {' '.join(arguments[:3])} lỗi: {detail[-1] if detail else 'unknown'}"
             )
-
-
-class CurrentProjectWorkspace(ProjectWorkspace):
-    """Use the supplied project directory directly without making a copy.
-
-    This mode is intentional: Codex edits the user's current checkout and those
-    edits remain there after the run.  A private snapshot of the initial project
-    is captured before Codex starts and is used as the clean validation source;
-    the live checkout is never temporarily reverted during validation.
-    """
-
-    in_place = True
-
-    def __init__(self, project):
-        super().__init__(project, Path(project.path).resolve().parent)
-        self.path = self.owner
-        self.parent = self.owner.parent
-        self._context_file: Path | None = None
-        self._context_original: bytes | None = None
-        self._context_existed = False
-        self._context_dir: Path | None = None
-        self._context_dir_existed = False
-        self._initial_diff = b""
-        self._initial_files: dict[str, bytes] = {}
-        self._captured = False
-        self._validation_base = None
-
-    def __enter__(self) -> "CurrentProjectWorkspace":
-        if not self.owner.is_dir():
-            raise WorkspaceError(f"Project không tồn tại: {self.owner}")
-        if self._captured:
-            return self
-        self._initial_files = self._file_state()
-        if (self.owner / ".git").exists():
-            self._initial_diff = self._git_diff_binary()
-        self._validation_base = ValidationWorkspace(self.project)
-        try:
-            self._validation_base.__enter__()
-        except BaseException:
-            self._validation_base = None
-            raise
-        self._captured = True
-        return self
-
-    def __exit__(self, exc_type, exc, traceback) -> None:
-        self.close()
-
-    def close(self) -> None:
-        context_file = self._context_file
-        if context_file is not None:
-            if self._context_existed:
-                context_file.parent.mkdir(parents=True, exist_ok=True)
-                context_file.write_bytes(self._context_original or b"")
-            elif context_file.exists() or context_file.is_symlink():
-                context_file.unlink()
-        context_dir = self._context_dir
-        if (
-            context_dir is not None
-            and not self._context_dir_existed
-            and context_dir.is_dir()
-            and not any(context_dir.iterdir())
-        ):
-            context_dir.rmdir()
-        self._context_file = None
-        self._context_dir = None
-        if self._validation_base is not None:
-            self._validation_base.close()
-            self._validation_base = None
-        self._captured = False
-
-    def write_baseline_context(self, text: str) -> None:
-        context_dir = self.owner / ".debugging-framework"
-        if context_dir.exists() and context_dir.is_symlink():
-            raise WorkspaceError(".debugging-framework là symlink; không ghi baseline context")
-        if context_dir.exists() and not context_dir.is_dir():
-            raise WorkspaceError(".debugging-framework không phải thư mục")
-        context_dir_existed = context_dir.exists()
-        context_dir.mkdir(parents=True, exist_ok=True)
-        context_file = context_dir / "baseline-output.txt"
-        if context_file.is_symlink():
-            raise WorkspaceError("baseline-output.txt là symlink; không ghi đè")
-        if context_file.exists() and not context_file.is_file():
-            raise WorkspaceError("baseline-output.txt không phải file")
-        if self._context_file is None:
-            self._context_file = context_file
-            self._context_dir = context_dir
-            self._context_existed = context_file.exists()
-            self._context_dir_existed = context_dir_existed
-            if self._context_existed:
-                self._context_original = context_file.read_bytes()
-        context_file.write_text(str(text or ""), encoding="utf-8", errors="replace")
-
-    def changed_repository_files(self) -> list[str]:
-        if (self.owner / ".git").exists():
-            changed = set(super().changed_repository_files())
-            current = self._file_state()
-            changed.update(
-                path for path in set(current) | set(self._initial_files)
-                if current.get(path) != self._initial_files.get(path)
-            )
-            return sorted(changed)
-        current = self._file_state()
-        return sorted(
-            path for path in set(current) | set(self._initial_files)
-            if current.get(path) != self._initial_files.get(path)
-        )
-
-    def unified_diff_paths(self, diff: str) -> list[str]:
-        text = str(diff or "")
-        if (self.owner / ".git").exists():
-            return self._unified_diff_paths(text)
-        # ProjectLoader supports non-git projects. Keep path extraction safe in
-        # direct mode even when there is no repository for `git apply` to use.
-        paths: list[str] = []
-        for line in text.splitlines():
-            if not line.startswith("diff --git "):
-                if line.startswith("+++ b/"):
-                    relpath = normalize_relpath(line[6:])
-                    if relpath and relpath not in paths:
-                        paths.append(relpath)
-                continue
-            fields = line.split()
-            if len(fields) != 4:
-                raise WorkspaceError("codex_diff_parse_failed:invalid diff header")
-            relpath = normalize_relpath(fields[3][2:] if fields[3].startswith("b/") else "")
-            if not relpath:
-                raise WorkspaceError("codex_diff_contains_unsafe_path")
-            if relpath not in paths:
-                paths.append(relpath)
-        if not paths:
-            raise WorkspaceError("codex_diff_parse_failed:unified diff has no files")
-        return paths
-
-    def snapshot_sha256s(self, relpaths: list[str]) -> dict[str, str | None]:
-        # Codex is allowed to edit the current checkout; comparing its files to
-        # a pre-Codex hash would reject the intended in-place workflow.
-        return {}
-
-    @contextmanager
-    def clean_source_for_validation(self):
-        """Yield the pre-Codex snapshot without mutating the live checkout."""
-        if self._validation_base is None or not self._validation_base.path.is_dir():
-            raise WorkspaceError("initial_validation_snapshot_unavailable")
-        yield self._validation_base.path
-
-    def _git_diff_binary(self) -> bytes:
-        completed = subprocess.run(
-            ["git", "-C", str(self.owner), "diff", "--binary", "--no-ext-diff"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=120,
-            check=False,
-        )
-        if completed.returncode != 0:
-            detail = completed.stderr.decode("utf-8", errors="replace").strip()
-            raise WorkspaceError(f"git diff lỗi: {detail or 'unknown'}")
-        return completed.stdout
-
-    def _file_state(self) -> dict[str, bytes]:
-        state: dict[str, bytes] = {}
-        for path in self.owner.rglob("*"):
-            if not path.is_file() or path.is_symlink():
-                continue
-            relative = path.relative_to(self.owner)
-            parts = {part.lower() for part in relative.parts}
-            if ".git" in parts or parts & GENERATED_PATH_COMPONENTS:
-                continue
-            try:
-                state[relative.as_posix()] = path.read_bytes()
-            except OSError:
-                continue
-        return state
-
-    def _restore_file_state(
-        self, target: dict[str, bytes], current: dict[str, bytes]
-    ) -> None:
-        changed = set(target) | set(current)
-        for relative in changed:
-            if target.get(relative) == current.get(relative):
-                continue
-            path = self.owner / relative
-            if relative in target:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(target[relative])
-            elif path.exists() or path.is_symlink():
-                path.unlink()
-
-    def _apply_diff(self, diff: bytes, *, reverse: bool = False) -> None:
-        command = ["git", "-C", str(self.owner), "apply"]
-        if reverse:
-            command.append("--reverse")
-        completed = subprocess.run(
-            command,
-            input=diff,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=120,
-            check=False,
-        )
-        if completed.returncode != 0:
-            detail = completed.stderr.decode("utf-8", errors="replace").strip()
-            raise WorkspaceError(f"git apply lỗi: {detail or 'unknown'}")
 
 
 class ValidationWorkspace:

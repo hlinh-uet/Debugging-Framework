@@ -1,11 +1,11 @@
-"""Project environment discovery and provisioning backends."""
+"""Explicit host/image environment contract."""
 
 from src.environments.spec import EnvironmentResolver, EnvironmentSpec
-from src.environments.docker import DockerProvision, RunningDockerEnvironment
+from src.environments.oci import OCIEnvironment, OCIProvision
 
 __all__ = [
-    "DockerProvision",
     "EnvironmentResolver",
     "EnvironmentSpec",
-    "RunningDockerEnvironment",
+    "OCIEnvironment",
+    "OCIProvision",
 ]

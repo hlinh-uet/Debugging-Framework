@@ -14,23 +14,14 @@ DEFAULT_RESULTS_DIR = (
     if os.environ.get("XDG_STATE_HOME")
     else Path.home() / ".local" / "state"
 ) / "debugging-framework" / "results"
-DEFAULT_DEFECTS4C_ROOT = PROJECT_ROOT.parent / "defects4c"
-
-# Old keys stay accepted so an existing .env does not prevent the new project-first CLI
-# from starting. They are deliberately not used by the runtime.
 KNOWN_ENV_KEYS = {
     "CODEX_API_KEY", "DEBUGGING_REQUIRE_API_KEY", "DEBUGGING_CODEX_PROVIDER",
     "DEBUGGING_CODEX_BASE_URL", "DEBUGGING_CODEX_WIRE_API", "DEBUGGING_CODEX_ENV_KEY",
     "DEBUGGING_CODEX_MODEL", "DEBUGGING_CODEX_BIN", "DEBUGGING_ATTEMPTS",
     "DEBUGGING_TIMEOUT", "DEBUGGING_COMMAND_TIMEOUT", "DEBUGGING_JOBS",
     "DEBUGGING_INHERIT_CODEX_CONFIG", "DEBUGGING_RESULTS_DIR",
-    "DEBUGGING_CODEX_WORKSPACE",
     "DEBUGGING_ENVIRONMENT_BACKEND", "DEBUGGING_ENVIRONMENT_RUNTIME",
-    "DEBUGGING_ENVIRONMENT_CONTAINER", "DEBUGGING_ENVIRONMENT_IMAGE",
-    "DEBUGGING_DEFECTS4C_ROOT",
-    "DEBUGGING_DATASET", "DEBUGGING_BUG_IDS", "DEBUGGING_INCLUDE_FIXED_FAIL_TESTS",
-    "DEBUGGING_ONLY_MISSING", "DEBUGGING_EVALUATE", "DEBUGGING_UNIFIED_ROOT",
-    "DEFECTS4C_CONTAINER",
+    "DEBUGGING_ENVIRONMENT_IMAGE",
 }
 
 
@@ -54,7 +45,7 @@ def read_env_file(path: Path = DEFAULT_ENV_FILE) -> dict[str, str]:
         values[key] = _parse_env_value(raw.strip(), path, line_number)
     unknown = sorted(
         key for key in values
-        if key.startswith(("DEBUGGING_", "CODEX_", "DEFECTS4C_")) and key not in KNOWN_ENV_KEYS
+        if key.startswith(("DEBUGGING_", "CODEX_")) and key not in KNOWN_ENV_KEYS
     )
     if unknown:
         raise ValueError(f"Biến .env không được hỗ trợ: {', '.join(unknown)}")
@@ -126,12 +117,11 @@ class FrameworkConfig:
     command_timeout_seconds: int = 1800
     jobs: int = 0
     inherit_codex_config: bool = False
-    codex_workspace: str = "auto"
-    environment_backend: str = "current"
+    # No implicit execution fallback: a project/CLI/.env must explicitly choose
+    # the caller-prepared host or a caller-packaged image.
+    environment_backend: str = ""
     environment_runtime: str = "auto"
-    environment_container: str = ""
     environment_image: str = ""
-    defects4c_root: Path = DEFAULT_DEFECTS4C_ROOT
 
     @classmethod
     def load(
@@ -144,11 +134,6 @@ class FrameworkConfig:
             return _value(name, files, active, default)
 
         timeout = get("DEBUGGING_TIMEOUT", "1800")
-        codex_workspace = get("DEBUGGING_CODEX_WORKSPACE", "auto")
-        if codex_workspace not in {"auto", "snapshot", "current"}:
-            raise ValueError(
-                "DEBUGGING_CODEX_WORKSPACE phải là auto, snapshot hoặc current"
-            )
         return cls(
             env_file=path.expanduser().resolve(),
             results_dir=_path(get("DEBUGGING_RESULTS_DIR"), DEFAULT_RESULTS_DIR),
@@ -169,17 +154,9 @@ class FrameworkConfig:
             inherit_codex_config=_bool(
                 "DEBUGGING_INHERIT_CODEX_CONFIG", get("DEBUGGING_INHERIT_CODEX_CONFIG", "false")
             ),
-            codex_workspace=codex_workspace,
-            environment_backend=get("DEBUGGING_ENVIRONMENT_BACKEND", "current"),
+            environment_backend=get("DEBUGGING_ENVIRONMENT_BACKEND", ""),
             environment_runtime=get("DEBUGGING_ENVIRONMENT_RUNTIME", "auto"),
-            environment_container=(
-                get("DEBUGGING_ENVIRONMENT_CONTAINER", "")
-                or get("DEFECTS4C_CONTAINER", "")
-            ),
             environment_image=get("DEBUGGING_ENVIRONMENT_IMAGE", ""),
-            defects4c_root=_path(
-                get("DEBUGGING_DEFECTS4C_ROOT"), DEFAULT_DEFECTS4C_ROOT
-            ),
         )
 
 
@@ -192,11 +169,9 @@ class Settings:
     codex_base_url: str = ""
     codex_wire_api: str = "responses"
     codex_env_key: str = "CODEX_API_KEY"
-    environment_backend: str = "current"
+    environment_backend: str = ""
     environment_runtime: str = "auto"
-    environment_container: str = ""
     environment_image: str = ""
-    defects4c_root: Path = DEFAULT_DEFECTS4C_ROOT
 
     @property
     def output_schema(self) -> Path:
@@ -205,17 +180,19 @@ class Settings:
     def validated(self) -> "Settings":
         if not self.output_schema.is_file():
             raise FileNotFoundError(f"Thiếu Codex output schema: {self.output_schema}")
-        if self.environment_backend not in {
-            "current", "local", "image", "oci", "container", "auto",
-        }:
+        if not self.environment_backend:
             raise ValueError(
-                "DEBUGGING_ENVIRONMENT_BACKEND phải là current, local, image, "
-                "oci, container hoặc auto"
+                "Phải chọn rõ environment mode: --environment host hoặc image; "
+                "framework không fallback môi trường"
             )
+        if self.environment_backend not in {"host", "image"}:
+            raise ValueError("Environment mode chỉ hỗ trợ host hoặc image")
         if self.environment_backend == "image" and not self.environment_image.strip():
             raise ValueError(
-                "DEBUGGING_ENVIRONMENT_IMAGE/--environment-image là bắt buộc với backend image"
+                "DEBUGGING_ENVIRONMENT_IMAGE/--environment-image là bắt buộc với mode image"
             )
+        if self.environment_backend == "host" and self.environment_image.strip():
+            raise ValueError("--environment-image chỉ được dùng với environment image")
         return Settings(
             results_dir=self.results_dir.expanduser().resolve(),
             codex_executable=self.codex_executable,
@@ -226,7 +203,5 @@ class Settings:
             codex_env_key=self.codex_env_key,
             environment_backend=self.environment_backend,
             environment_runtime=self.environment_runtime,
-            environment_container=self.environment_container,
             environment_image=self.environment_image.strip(),
-            defects4c_root=self.defects4c_root.expanduser().resolve(),
         )

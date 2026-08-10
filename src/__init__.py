@@ -1,1 +1,1 @@
-"""General project-in, raw-patch-out framework with isolated validation."""
+"""Automated C/C++ repair framework with isolated patch validation."""

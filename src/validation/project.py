@@ -5,10 +5,8 @@ import hashlib
 import os
 import re
 import shlex
-import shutil
 import signal
 import subprocess
-import sys
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -16,16 +14,18 @@ from pathlib import Path
 from typing import Iterable
 
 from src.loaders.project import Project
-from src.environments.docker import DockerProvision, RunningDockerEnvironment
 from src.environments.oci import OCIEnvironment, OCIProvision
 from src.environments.spec import EnvironmentResolver, EnvironmentSpec
-from src.utils.workspace import ValidationWorkspace, normalize_relpath
+from src.utils.project_config import read_project_config_data
+from src.utils.workspace import (
+    ValidationWorkspace,
+    non_repairable_patch_paths,
+    normalize_relpath,
+)
 
 
 BUILTIN_TEST_SYSTEMS = {
-    "autotools", "bazel", "cargo", "cmake", "composer", "dotnet",
-    "gradle", "go", "make", "maven", "meson", "ninja", "node",
-    "python", "ruby", "swift", "defects4c-rendered-recipe",
+    "autotools", "bazel", "cmake", "make", "meson", "ninja",
 }
 
 TEST_EXECUTION_PATTERNS = tuple(
@@ -92,6 +92,7 @@ class CommandSpec:
 
 @dataclass(frozen=True)
 class BuildPlan:
+    """Setup, build, target-test and regression-test validation contract."""
     system: str
     setup: tuple[CommandSpec, ...]
     build: tuple[CommandSpec, ...]
@@ -168,81 +169,13 @@ class BuildDetector:
                 (CommandSpec("meson-build", ("meson", "compile", "-C", build_dir)),),
                 (CommandSpec("meson-test", ("meson", "test", "-C", build_dir, "--print-errorlogs")),),
             )
-        if (root / "Cargo.toml").is_file():
-            fetch = ("cargo", "fetch", "--locked") if (root / "Cargo.lock").is_file() else ("cargo", "fetch")
-            return BuildPlan(
-                "cargo", (CommandSpec("cargo-fetch", fetch),),
-                (CommandSpec("cargo-build", ("cargo", "build", "--all-targets")),),
-                (CommandSpec("cargo-test", ("cargo", "test", "--all-targets")),),
-            )
-        if (root / "go.mod").is_file():
-            return BuildPlan(
-                "go", (CommandSpec("go-mod-download", ("go", "mod", "download")),),
-                (CommandSpec("go-build", ("go", "build", "./...")),),
-                (CommandSpec("go-test", ("go", "test", "./...")),),
-            )
-        if (root / "pom.xml").is_file():
-            mvn = "./mvnw" if (root / "mvnw").is_file() else "mvn"
-            return BuildPlan(
-                "maven",
-                (CommandSpec("maven-resolve", (mvn, "-q", "-DskipTests", "dependency:go-offline")),),
-                (CommandSpec("maven-build", (mvn, "-q", "-DskipTests", "package")),),
-                (CommandSpec("maven-test", (mvn, "-q", "test")),),
-            )
-        if any((root / name).is_file() for name in ("build.gradle", "build.gradle.kts", "gradlew")):
-            gradle = "./gradlew" if (root / "gradlew").is_file() else "gradle"
-            return BuildPlan(
-                "gradle", (),
-                (CommandSpec("gradle-build", (gradle, "assemble")),),
-                (CommandSpec("gradle-test", (gradle, "test")),),
-            )
-        if (root / "package.json").is_file():
-            return self._node(root)
         if any(
             (root / name).is_file()
-            for name in (
-                "pyproject.toml", "pytest.ini", "setup.cfg", "setup.py",
-                "requirements.txt", "requirements-dev.txt", "requirements-test.txt",
-            )
+            for name in ("WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel")
         ):
-            return self._python(root)
-        if (root / "Package.swift").is_file():
-            return BuildPlan(
-                "swift", (CommandSpec("swift-resolve", ("swift", "package", "resolve")),),
-                (CommandSpec("swift-build", ("swift", "build")),),
-                (CommandSpec("swift-test", ("swift", "test")),),
-            )
-        if (root / "Gemfile").is_file():
-            return BuildPlan(
-                "ruby",
-                (CommandSpec("bundle-install", ("bundle", "install")),),
-                (),
-                (CommandSpec("ruby-test", ("bundle", "exec", "rake", "test")),),
-            )
-        if (root / "composer.json").is_file():
-            return BuildPlan(
-                "composer",
-                (
-                    CommandSpec(
-                        "composer-install",
-                        ("composer", "install", "--no-interaction", "--prefer-dist"),
-                    ),
-                ),
-                (),
-                (CommandSpec("composer-test", ("composer", "test")),),
-            )
-        if (root / "WORKSPACE").is_file() or (root / "MODULE.bazel").is_file():
             return BuildPlan(
                 "bazel", (), (),
                 (CommandSpec("bazel-test", ("bazel", "test", "//...")),),
-            )
-        dotnet = sorted(root.glob("*.sln")) or sorted(root.glob("*.csproj"))
-        if dotnet:
-            target = dotnet[0].name
-            return BuildPlan(
-                "dotnet", (CommandSpec("dotnet-restore", ("dotnet", "restore", target)),),
-                (CommandSpec("dotnet-build", ("dotnet", "build", target, "--no-restore")),),
-                (CommandSpec("dotnet-test", ("dotnet", "test", target, "--no-build")),),
             )
         make = self._make(root)
         if make:
@@ -259,15 +192,16 @@ class BuildDetector:
         )
 
     def _project_configuration(self, root: Path) -> BuildPlan | None:
-        path = root / ".debugging-framework.json"
-        if not path.is_file():
+        path, raw = read_project_config_data(root)
+        if not raw:
             return None
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"Cấu hình project không hợp lệ {path}: {exc}") from exc
-        if not isinstance(raw, dict):
-            raise ValueError(f"Cấu hình project phải là JSON object: {path}")
+
+        # A project may contain only runtime repair settings. In that case its
+        # native build system must still be auto-detected rather than treating
+        # the file as an incomplete custom test contract.
+        command_fields = {"setup", "build", "test", "target_test", "regression_test"}
+        if not any(field in raw for field in command_fields):
+            return None
 
         def commands(phase: str) -> tuple[CommandSpec, ...]:
             value = raw.get(phase, [])
@@ -419,118 +353,6 @@ class BuildDetector:
             (test_command,),
         )
 
-    @staticmethod
-    def _node(root: Path) -> BuildPlan:
-        try:
-            package = json.loads((root / "package.json").read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"package.json không hợp lệ: {exc}") from exc
-        scripts = package.get("scripts") if isinstance(package, dict) else {}
-        scripts = scripts if isinstance(scripts, dict) else {}
-        manager = "npm"
-        if (root / "pnpm-lock.yaml").is_file():
-            manager = "pnpm"
-        elif (root / "yarn.lock").is_file():
-            manager = "yarn"
-        elif isinstance(package, dict):
-            declared = str(package.get("packageManager") or "").split("@", 1)[0]
-            if declared in {"npm", "pnpm", "yarn"}:
-                manager = declared
-        if manager == "pnpm":
-            install = (
-                ("pnpm", "install", "--frozen-lockfile")
-                if (root / "pnpm-lock.yaml").is_file()
-                else ("pnpm", "install")
-            )
-        elif manager == "yarn":
-            install = (
-                ("yarn", "install", "--frozen-lockfile")
-                if (root / "yarn.lock").is_file()
-                else ("yarn", "install")
-            )
-        elif (root / "package-lock.json").is_file() or (root / "npm-shrinkwrap.json").is_file():
-            install = ("npm", "ci")
-        else:
-            install = ("npm", "install")
-        build = ()
-        if "build" in scripts:
-            build = (CommandSpec("node-build", (manager, "run", "build")),)
-        if "test" not in scripts:
-            raise ValueError("package.json không có scripts.test để validation tự động")
-        return BuildPlan(
-            "node",
-            (CommandSpec("node-install", install),),
-            build,
-            (CommandSpec("node-test", (manager, "test")),),
-        )
-
-    @staticmethod
-    def _python(root: Path) -> BuildPlan:
-        environment = ".debugging-framework/venv"
-        python = f"{environment}/bin/python"
-        requirements = [
-            name
-            for name in (
-                "requirements.txt", "requirements-dev.txt", "requirements-test.txt",
-                "dev-requirements.txt", "requirements/dev.txt", "requirements/test.txt",
-            )
-            if (root / name).is_file()
-        ]
-        install_args: list[str] = [python, "-m", "pip", "install", "--disable-pip-version-check"]
-        for requirement in requirements:
-            install_args.extend(("-r", requirement))
-        if BuildDetector._python_is_installable(root):
-            install_args.extend(("-e", ".[test]" if BuildDetector._python_has_test_extra(root) else "."))
-        install_args.append("pytest")
-        return BuildPlan(
-            "python",
-            (
-                CommandSpec("python-venv", (sys.executable, "-m", "venv", environment)),
-                CommandSpec("python-install", tuple(install_args)),
-            ),
-            (),
-            (CommandSpec("pytest", (python, "-m", "pytest", "-q")),),
-        )
-
-    @staticmethod
-    def _python_is_installable(root: Path) -> bool:
-        if (root / "setup.py").is_file():
-            return True
-        setup_cfg = root / "setup.cfg"
-        if setup_cfg.is_file() and re.search(
-            r"(?m)^\s*\[(?:metadata|options)\]\s*(?:#.*)?$",
-            setup_cfg.read_text(encoding="utf-8", errors="replace"),
-        ):
-            return True
-        pyproject = root / "pyproject.toml"
-        if not pyproject.is_file():
-            return False
-        text = pyproject.read_text(encoding="utf-8", errors="replace")
-        return bool(
-            re.search(
-                r"(?m)^\s*\[(?:build-system|project|tool\.(?:poetry|pdm|hatch))\]\s*(?:#.*)?$",
-                text,
-            )
-        )
-
-    @staticmethod
-    def _python_has_test_extra(root: Path) -> bool:
-        """Only request an optional test extra when the project declares it."""
-        pyproject = root / "pyproject.toml"
-        if pyproject.is_file():
-            text = pyproject.read_text(encoding="utf-8", errors="replace")
-            if re.search(r"(?m)^\s*test\s*=\s*\[", text):
-                return True
-            if re.search(r"(?m)^\s*test\s*=\s*\{", text):
-                return True
-        setup_cfg = root / "setup.cfg"
-        if setup_cfg.is_file() and re.search(
-            r"(?m)^\s*test\s*=", setup_cfg.read_text(encoding="utf-8", errors="replace")
-        ):
-            return True
-        return False
-
-
 class ProjectValidator:
     """Run isolated validation on a project or an applied diff."""
 
@@ -539,52 +361,31 @@ class ProjectValidator:
         *,
         command_timeout: int = 1800,
         jobs: int = 0,
-        sandbox_executable: str = "bwrap",
-        environment_backend: str = "current",
+        environment_backend: str,
         environment_runtime: str = "auto",
-        environment_container: str = "",
         environment_image: str = "",
-        prepared_environment: bool = False,
     ):
         self.command_timeout = command_timeout
         self.detector = BuildDetector(jobs=jobs)
-        self.sandbox_executable = shutil.which(sandbox_executable)
-        if environment_backend not in {
-            "current", "local", "image", "container", "oci", "auto",
-        }:
-            raise ValueError(
-                "environment_backend phải là current, local, image, container, oci hoặc auto"
-            )
+        if environment_backend not in {"host", "image"}:
+            raise ValueError("environment mode chỉ hỗ trợ host hoặc image; không fallback")
         if environment_backend == "image" and not environment_image.strip():
-            raise ValueError("environment_image là bắt buộc với backend image")
+            raise ValueError("environment_image là bắt buộc với mode image")
+        if environment_backend == "host" and environment_image.strip():
+            raise ValueError("environment_image chỉ được dùng với mode image")
         self.environment_backend = environment_backend
         self.environment_image = environment_image.strip()
-        self.prepared_environment = prepared_environment
         self.environment_runtime = OCIEnvironment(runtime=environment_runtime)
-        self.environment_container = RunningDockerEnvironment(
-            runtime=environment_runtime,
-            container=environment_container,
-            timeout_seconds=command_timeout,
-        )
         self.environment_resolver = EnvironmentResolver()
-        self._active_provision: OCIProvision | DockerProvision | None = None
+        self._active_provision: OCIProvision | None = None
         self._active_backend = ""
 
     def resolve_environment(self, project: Project, plan: BuildPlan | None = None) -> EnvironmentSpec:
         plan = plan or self.inspect(project)
-        backend = self.environment_backend
-        if backend == "auto":
-            backend = (
-                "container"
-                if self.environment_container.resolve_container(project.project_id)
-                else "oci"
-                if self.environment_runtime.available
-                else "current"
-            )
         return self.environment_resolver.resolve(
             project.path,
             plan.system,
-            backend=backend,
+            backend=self.environment_backend,
             image=self.environment_image,
         )
 
@@ -595,60 +396,9 @@ class ProjectValidator:
 
     def inspect(self, project: Project) -> BuildPlan:
         plan = self.detector.detect(project.path)
-        if self.prepared_environment:
-            plan = self._use_prepared_environment(plan)
         if not plan.test:
             raise ValueError(f"Không tìm thấy test command cho project {project.path}")
         return plan
-
-    @staticmethod
-    def _use_prepared_environment(plan: BuildPlan) -> BuildPlan:
-        """Remove inferred dependency provisioning for caller-prepared repairs.
-
-        Explicit commands from ``.debugging-framework.json`` use the
-        ``project-config``/custom system and remain authoritative.  Conventional
-        detectors may otherwise fetch/install dependencies even though the
-        repair contract says the caller already prepared them.
-        """
-        dependency_labels = {
-            "cargo-fetch",
-            "go-mod-download",
-            "maven-resolve",
-            "node-install",
-            "python-venv",
-            "python-install",
-            "swift-resolve",
-            "bundle-install",
-            "composer-install",
-            "dotnet-restore",
-        }
-        setup = tuple(item for item in plan.setup if item.label not in dependency_labels)
-
-        def current_python(commands: tuple[CommandSpec, ...]) -> tuple[CommandSpec, ...]:
-            if plan.system != "python":
-                return commands
-            converted = []
-            for item in commands:
-                argv = list(item.argv)
-                if argv and argv[0] == ".debugging-framework/venv/bin/python":
-                    argv[0] = sys.executable
-                converted.append(CommandSpec(
-                    item.label,
-                    tuple(argv),
-                    item.cwd,
-                    item.evidence_pattern,
-                    item.failure_pattern,
-                ))
-            return tuple(converted)
-
-        return BuildPlan(
-            plan.system,
-            setup,
-            plan.build,
-            current_python(plan.test),
-            current_python(plan.target_test),
-            current_python(plan.regression_test),
-        )
 
     def baseline(
         self,
@@ -661,8 +411,6 @@ class ProjectValidator:
     ) -> dict:
         """Reproduce the supplied failing test on a clean project snapshot."""
         self._require_artifacts_outside_input(project, artifact_dir)
-        if self._requires_bwrap() and not self.sandbox_executable:
-            return self.invalid_snapshot("validation_sandbox_unavailable:bwrap")
         with ValidationWorkspace(project) as workspace:
             snapshot_project = Project(path=workspace.path, project_id=project.project_id)
             plan = self.inspect(snapshot_project)
@@ -677,8 +425,6 @@ class ProjectValidator:
                 provision = self._provision_environment(
                     environment,
                     artifact_dir / "environment",
-                    workspace.path,
-                    project_id=project.project_id,
                 )
                 self._active_provision = provision
                 if failing_tests:
@@ -694,7 +440,6 @@ class ProjectValidator:
                     f"environment_provision_failed:{type(exc).__name__}:{exc}"
                 )
             finally:
-                self._cleanup_environment(provision)
                 self._active_provision = None
                 self._active_backend = ""
         self._attach_environment_result(snapshot, environment, provision)
@@ -735,8 +480,6 @@ class ProjectValidator:
             provision = self._provision_environment(
                 environment,
                 artifact_dir / "environment",
-                project.path,
-                project_id=project.project_id,
             )
         snapshot = {
             "status": "failing",
@@ -772,7 +515,6 @@ class ProjectValidator:
             "environment_backend": environment.backend,
             "provisioned_image": getattr(provision, "image", ""),
             "provisioned_image_digest": getattr(provision, "image_digest", ""),
-            "provisioned_container": "",
             "environment": environment.as_dict(),
             "environment_digest": environment.digest,
             "plan_digest": plan_digest,
@@ -798,13 +540,21 @@ class ProjectValidator:
         expected_image_digest: str = "",
     ) -> dict:
         self._require_artifacts_outside_input(project, artifact_dir)
-        if self._requires_bwrap() and not self.sandbox_executable:
-            return self.invalid_snapshot("validation_sandbox_unavailable:bwrap")
         normalized_paths = [normalize_relpath(path) for path in patch_paths]
         if not normalized_paths or any(not path for path in normalized_paths):
             return self.invalid_snapshot("patch_contains_unsafe_path")
         if len(set(normalized_paths)) != len(normalized_paths):
             return self.invalid_snapshot("patch_contains_duplicate_path")
+        blocked_paths = non_repairable_patch_paths(normalized_paths)
+        if blocked_paths:
+            snapshot = self.invalid_snapshot(
+                "test_oracle_modified_or_non_production_patch:"
+                + ",".join(blocked_paths)
+            )
+            snapshot["test_oracle_modified"] = True
+            snapshot["blocked_patch_paths"] = blocked_paths
+            snapshot["patch_paths"] = normalized_paths
+            return snapshot
         owner_root = project.path.resolve()
         for relpath, expected in (expected_sha256s or {}).items():
             normalized = normalize_relpath(relpath)
@@ -837,8 +587,6 @@ class ProjectValidator:
                 provision = self._provision_environment(
                     environment,
                     artifact_dir / "environment",
-                    workspace.path,
-                    project_id=project.project_id,
                 )
                 if (
                     expected_image_digest
@@ -861,7 +609,6 @@ class ProjectValidator:
                     f"environment_provision_failed:{type(exc).__name__}:{exc}"
                 )
             finally:
-                self._cleanup_environment(provision)
                 self._active_provision = None
                 self._active_backend = ""
         snapshot["patch_paths"] = applied_paths
@@ -877,6 +624,7 @@ class ProjectValidator:
         return {
             "status": "invalid",
             "validation_error": error,
+            "validation_executed": False,
             "build_system": "",
             "tests_executed": False,
             "failed_test_ids": [],
@@ -888,63 +636,39 @@ class ProjectValidator:
             "environment_provisioned": False,
             "setup_executed": False,
             "validation_workspace_isolated": True,
-            "validation_process_sandboxed": bool(
-                self.sandbox_executable
-                if self._requires_bwrap()
-                else self.environment_container.runtime_available
-                if self.environment_backend == "container"
-                else self.environment_runtime.available
-            ),
+            "validation_process_sandboxed": self._validation_process_sandboxed(),
             "input_project_untouched": True,
         }
 
-    def _requires_bwrap(self) -> bool:
-        backend = self.environment_backend
-        if backend == "auto":
-            backend = (
-                "container"
-                if self.environment_container.runtime_available
-                else "oci"
-                if self.environment_runtime.available
-                else "current"
-            )
-        return backend == "local"
+    def _validation_process_sandboxed(self) -> bool:
+        """Only the prebuilt image mode isolates validation from the host."""
+        backend = self._active_backend or self.environment_backend
+        return backend == "image" and self.environment_runtime.available
 
     def _provision_environment(
         self,
         spec: EnvironmentSpec,
         artifact_dir: Path,
-        project_root: Path | None = None,
-        *,
-        project_id: str = "",
     ):
         self._active_backend = spec.backend
-        if spec.backend == "container":
-            return self.environment_container.provision(
-                spec,
-                artifact_dir,
-                project_root,
-                project_id=project_id,
-            )
-        if spec.backend in {"image", "oci"}:
-            return self.environment_runtime.provision(spec, artifact_dir, project_root)
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        return None
-
-    def _cleanup_environment(self, provision) -> None:
-        if isinstance(provision, DockerProvision):
-            self.environment_container.cleanup(provision)
+        if spec.backend == "image":
+            return self.environment_runtime.provision(spec, artifact_dir)
+        if spec.backend == "host":
+            return None
+        raise RuntimeError(f"environment_mode_unsupported:{spec.backend}")
 
     @staticmethod
     def _attach_environment_result(snapshot: dict, spec: EnvironmentSpec, provision) -> None:
         snapshot["environment_backend"] = spec.backend
+        snapshot["environment_ready"] = spec.backend == "host" or provision is not None
         if provision is not None:
             snapshot["environment_provisioned"] = True
             snapshot["provisioned_image"] = getattr(provision, "image", "")
             snapshot["provisioned_image_digest"] = getattr(provision, "image_digest", "")
-            snapshot["provisioned_container"] = getattr(provision, "container", "")
         else:
-            snapshot.setdefault("environment_provisioned", bool(snapshot.get("setup_commands")))
+            snapshot["environment_provisioned"] = False
+            snapshot["provisioned_image"] = ""
+            snapshot["provisioned_image_digest"] = ""
 
     def _run_target_baseline(
         self,
@@ -1099,32 +823,8 @@ class ProjectValidator:
         for spec in plan.test:
             argv = list(spec.argv)
             command_text = " ".join(argv)
-            if system == "python" or "pytest" in argv or "pytest" in command_text:
-                if "pytest" in argv:
-                    if "-q" in argv:
-                        argv[argv.index("-q")] = "-vv"
-                    elif not any(item.startswith("-") and "v" in item for item in argv):
-                        argv.append("-vv")
-                argv.extend(selectors)
-            elif system == "node" or argv[:1] in (["npm"], ["pnpm"], ["yarn"]):
-                argv.extend(["--", *selectors])
-            elif system == "cargo" or "cargo" in argv:
-                try:
-                    index = argv.index("test") + 1
-                except ValueError:
-                    index = len(argv)
-                argv[index:index] = [selectors[0]]
-            elif system == "go" or "go" in argv:
-                argv.extend(["-run", "^(?:" + "|".join(re.escape(item) for item in selectors) + ")$"])
-            elif system == "maven" or "mvn" in command_text:
-                argv.extend([f"-Dtest={','.join(selectors)}"])
-            elif system == "gradle" or "gradle" in command_text:
-                for selector in selectors:
-                    argv.extend(["--tests", selector])
-            elif system == "cmake" or "ctest" in command_text:
+            if system == "cmake" or "ctest" in command_text:
                 argv.extend(["-R", "|".join(re.escape(item) for item in selectors)])
-            elif system == "dotnet" or "dotnet" in command_text:
-                argv.extend(["--filter", "|".join(f"Name~{item}" for item in selectors)])
             else:
                 # For custom runners, executing the declared command is safer
                 # than inventing shell syntax.  The report/output evidence is
@@ -1194,7 +894,6 @@ class ProjectValidator:
             return snapshot("invalid", "test_timeout")
         if any(
             item.returncode == 127
-            or "No module named pytest" in item.output
             or "command not found" in item.output.lower()
             for item in tests
         ):
@@ -1491,9 +1190,7 @@ class ProjectValidator:
             ),
             "failure_output": "\n\n".join(item.output[-20_000:] for item in tests if not item.ok),
             "execution_output": self._execution_output(setup, build, tests),
-            "validation_process_sandboxed": bool(
-                self._active_provision is not None or self.sandbox_executable
-            ),
+            "validation_process_sandboxed": self._validation_process_sandboxed(),
         }
 
     @staticmethod
@@ -1530,33 +1227,22 @@ class ProjectValidator:
             if not cwd.is_dir():
                 result = CommandResult(spec.label, list(spec.argv), str(cwd), 127, "cwd_missing", 0.0)
             else:
-                result = self._run_one(
-                    spec, cwd, root, network_allowed="setup" in log_prefix
-                )
+                result = self._run_one(spec, cwd, root)
             results.append(result)
             log = artifact_dir / f"{log_prefix}-{index:02d}-{_safe_label(spec.label)}.log"
             log.write_text(result.output, encoding="utf-8", errors="replace")
-            self._sync_active_workspace(root)
             if not result.ok:
                 break
         return results
-
-    def _sync_active_workspace(self, root: Path) -> None:
-        if isinstance(self._active_provision, DockerProvision):
-            self.environment_container.sync_from_container(self._active_provision, root)
 
     def _run_one(
         self,
         spec: CommandSpec,
         cwd: Path,
         root: Path,
-        *,
-        network_allowed: bool = False,
     ) -> CommandResult:
         started = time.monotonic()
-        command = self._sandboxed_command(
-            spec.argv, root, cwd, network_allowed=network_allowed
-        )
+        command = self._execution_command(spec.argv, root, cwd)
         try:
             process = subprocess.Popen(
                 command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1587,13 +1273,11 @@ class ProjectValidator:
             output or "", time.monotonic() - started, timed_out,
         )
 
-    def _sandboxed_command(
+    def _execution_command(
         self,
         argv: tuple[str, ...],
         root: Path,
         cwd: Path,
-        *,
-        network_allowed: bool = False,
     ) -> list[str]:
         if isinstance(self._active_provision, OCIProvision):
             return self.environment_runtime.command(
@@ -1601,132 +1285,12 @@ class ProjectValidator:
                 root,
                 argv,
                 cwd,
-                network=network_allowed,
             )
-        if isinstance(self._active_provision, DockerProvision):
-            return self.environment_container.command(
-                self._active_provision,
-                root,
-                argv,
-                cwd,
-                network=network_allowed,
-            )
-        if self._active_backend == "current":
+        if self._active_backend == "host":
             return list(argv)
-        if not self.sandbox_executable:
-            raise RuntimeError("validation_sandbox_unavailable:bwrap")
-        root = root.resolve()
-        cwd = cwd.resolve()
-        try:
-            cwd.relative_to(root)
-            root.relative_to(Path("/tmp"))
-        except ValueError as exc:
-            raise ValueError("Validation workspace phải nằm dưới /tmp") from exc
-
-        # Make the host filesystem read-only, replace /tmp with a private tmpfs,
-        # then mount only this disposable validation snapshot read-write. This
-        # prevents project-controlled build/test commands from writing back to
-        # the input checkout through absolute paths.
-        destination_dirs: list[str] = []
-        current = Path("/tmp")
-        for part in root.relative_to(Path("/tmp")).parts:
-            current /= part
-            destination_dirs.extend(["--dir", str(current)])
-        environment_root = root / ".debugging-framework" / "environment"
-        cache_root = environment_root / "cache"
-        for directory in (
-            cache_root / "pip",
-            cache_root / "npm",
-            cache_root / "yarn",
-            cache_root / "xdg",
-            environment_root / "gradle",
-            environment_root / "cargo",
-            environment_root / "go-mod",
-            environment_root / "go-build",
-            environment_root / "maven",
-            environment_root / "composer",
-            environment_root / "bundle",
-            environment_root / "nuget",
-            environment_root / "dotnet-home",
-        ):
-            directory.mkdir(parents=True, exist_ok=True)
-        maven_options = " ".join(
-            value
-            for value in (
-                os.environ.get("MAVEN_OPTS", "").strip(),
-                f"-Dmaven.repo.local={environment_root / 'maven'}",
-            )
-            if value
+        raise RuntimeError(
+            f"environment_not_ready: mode={self._active_backend or self.environment_backend}"
         )
-        network_options = ["--share-net"] if network_allowed else []
-        return [
-            self.sandbox_executable,
-            "--die-with-parent",
-            "--new-session",
-            *network_options,
-            "--ro-bind",
-            "/",
-            "/",
-            "--dev",
-            "/dev",
-            "--tmpfs",
-            "/tmp",
-            *destination_dirs,
-            "--bind",
-            str(root),
-            str(root),
-            "--chdir",
-            str(cwd),
-            "--setenv",
-            "TMPDIR",
-            "/tmp",
-            "--setenv",
-            "PWD",
-            str(cwd),
-            "--setenv",
-            "PIP_CACHE_DIR",
-            str(cache_root / "pip"),
-            "--setenv",
-            "npm_config_cache",
-            str(cache_root / "npm"),
-            "--setenv",
-            "YARN_CACHE_FOLDER",
-            str(cache_root / "yarn"),
-            "--setenv",
-            "XDG_CACHE_HOME",
-            str(cache_root / "xdg"),
-            "--setenv",
-            "GRADLE_USER_HOME",
-            str(environment_root / "gradle"),
-            "--setenv",
-            "CARGO_HOME",
-            str(environment_root / "cargo"),
-            "--setenv",
-            "GOMODCACHE",
-            str(environment_root / "go-mod"),
-            "--setenv",
-            "GOCACHE",
-            str(environment_root / "go-build"),
-            "--setenv",
-            "MAVEN_OPTS",
-            maven_options,
-            "--setenv",
-            "COMPOSER_HOME",
-            str(environment_root / "composer"),
-            "--setenv",
-            "COMPOSER_CACHE_DIR",
-            str(cache_root / "composer"),
-            "--setenv",
-            "BUNDLE_PATH",
-            str(environment_root / "bundle"),
-            "--setenv",
-            "NUGET_PACKAGES",
-            str(environment_root / "nuget"),
-            "--setenv",
-            "DOTNET_CLI_HOME",
-            str(environment_root / "dotnet-home"),
-            *argv,
-        ]
 
 def _safe_label(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._") or "command"

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "debugging-framework"
 version = "0.5.0"
-description = "General project-in, validated-patch-out debugging tool driven by Codex CLI"
+description = "Automated C/C++ fault-localization and validated patch repair driven by Codex CLI"
 readme = "README.md"
 requires-python = ">=3.10"
 

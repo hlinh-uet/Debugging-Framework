@@ -18,7 +18,6 @@ def build_codex_prompt(
     failing_tests: list[str] | tuple[str, ...] | None = None,
     previous_attempt: Optional[dict] = None,
     baseline: Optional[dict] = None,
-    workspace_mode: str = "snapshot",
 ) -> str:
     failing_tests = tuple(
         str(value).strip() for value in (failing_tests or ()) if str(value).strip()
@@ -60,7 +59,7 @@ def build_codex_prompt(
             "as authoritative baseline evidence; do not rerun the test."
             if baseline.get("baseline_external")
             else
-            "The framework has already provisioned the environment and reproduced the "
+            "The framework used the explicitly selected prepared environment and reproduced the "
             "requested failure before this attempt. Treat this as authoritative baseline "
             "evidence;"
         )
@@ -98,14 +97,13 @@ def build_codex_prompt(
             "The caller supplied the failing-test output and the framework selected the "
             "validation workflow; focus on FL/APR and use that supplied baseline."
             if baseline and baseline.get("baseline_external")
-            else "The framework has already provisioned the environment and selected the "
+            else "The framework used the caller-prepared environment and selected the "
             "validation workflow; focus on FL/APR and use the supplied baseline."
         )
         if baseline
         else
-        "The framework has already copied the project here but has not installed, "
-        "built, or tested it. Take full ownership of repository investigation and "
-        "environment setup."
+        "The framework has copied the project here. The environment is prepared by the "
+        "caller; do not install dependencies or alter its environment contract."
     )
     investigation_context = (
         "Read `.debugging-framework/baseline-output.txt` (the complete supplied baseline output), "
@@ -115,16 +113,12 @@ def build_codex_prompt(
         if baseline
         else
         "First inspect repository documentation, manifests, lockfiles, CI configuration, "
-        "build files, and test layout. Determine the project-native setup/build/test "
-        "workflow, install declared dependencies inside this workspace, build it, and "
-        "reproduce its failing tests."
+        "build files, and test layout. Use only the caller-prepared tools already available; "
+        "do not install dependencies or change the environment contract."
     )
 
     workspace_description = (
-        "This is the supplied project workspace. Codex may edit it directly; keep the "
-        "repair focused on the requested source files and do not remove unrelated user changes."
-        if workspace_mode == "current"
-        else "This is a disposable, writable snapshot of the input project. The framework has already "
+        "This is a disposable, writable snapshot of the input project. The framework has "
         "copied the entire project, including source, tests, manifests, lockfiles and documentation."
     )
     return f"""You are a software engineer performing fault localization and program repair.
@@ -138,12 +132,14 @@ invariants; implement and test the smallest root-cause repair.
 
 Constraints:
 - Do not browse for solutions or use git history, hidden accepted fixes, ground truth,
-  or external source artifacts. Network access is only for repository-declared dependency
-  managers and registries needed to set up and test this project.
-- You may change one or more repository files needed for the repair and may run the
-  project's setup/build/tests. Never install host/system packages or write outside it.
-- Do not weaken or delete tests merely to make validation pass. Do not include generated
-  build output, caches, dependency/vendor trees, or credentials in the repair.
+  or external source artifacts. Do not use the network to provision dependencies.
+- The repair diff may modify only production C/C++ source/header files. Do not modify
+  tests, fixtures, build files, scripts, Dockerfiles, project configuration, or validation
+  commands. You may run the project's existing build/tests.
+- Never install dependencies or host/system packages, change the selected environment,
+  or write outside the workspace. Do not weaken or delete tests merely to make validation
+  pass. Do not include generated build output, caches, dependency/vendor trees, or
+  credentials in the repair.
 - Make the smallest root-cause fix that preserves public APIs and project style.
 - `repair.paths` must list every intentionally changed repository-relative file.
 - `repair.diff` must be a raw unified/Git diff beginning with `diff --git a/...`
