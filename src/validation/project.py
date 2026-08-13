@@ -16,7 +16,11 @@ from typing import Iterable
 from src.loaders.project import Project
 from src.environments.oci import OCIEnvironment, OCIProvision
 from src.environments.spec import EnvironmentResolver, EnvironmentSpec
-from src.utils.project_config import read_project_config_data
+from src.utils.project_config import (
+    PROJECT_CONFIG_SCHEMA_VERSION,
+    read_project_config_data,
+    read_project_config_file,
+)
 from src.utils.workspace import (
     ValidationWorkspace,
     non_repairable_patch_paths,
@@ -92,25 +96,27 @@ class CommandSpec:
 
 @dataclass(frozen=True)
 class BuildPlan:
-    """Setup, build, target-test and regression-test validation contract."""
+    """Setup, build, optional target-test and required full-suite contract."""
     system: str
     setup: tuple[CommandSpec, ...]
     build: tuple[CommandSpec, ...]
-    test: tuple[CommandSpec, ...]
+    regression_test: tuple[CommandSpec, ...]
     target_test: tuple[CommandSpec, ...] = ()
-    regression_test: tuple[CommandSpec, ...] = ()
+
+    @property
+    def test(self) -> tuple[CommandSpec, ...]:
+        """Compatibility alias for callers that still refer to the full suite as test."""
+        return self.regression_test
 
     def as_dict(self) -> dict:
         value = {
             "system": self.system,
             "setup": [item.as_dict() for item in self.setup],
             "build": [item.as_dict() for item in self.build],
-            "test": [item.as_dict() for item in self.test],
+            "regression_test": [item.as_dict() for item in self.regression_test],
         }
         if self.target_test:
             value["target_test"] = [item.as_dict() for item in self.target_test]
-        if self.regression_test:
-            value["regression_test"] = [item.as_dict() for item in self.regression_test]
         return value
 
 
@@ -149,9 +155,9 @@ class BuildDetector:
     def __init__(self, jobs: int = 0):
         self.jobs = jobs or max(1, min(8, os.cpu_count() or 1))
 
-    def detect(self, root: Path) -> BuildPlan:
+    def detect(self, root: Path, config_path: Path | None = None) -> BuildPlan:
         root = root.resolve()
-        configured = self._project_configuration(root)
+        configured = self._project_configuration(root, config_path)
         if configured:
             return configured
 
@@ -191,8 +197,14 @@ class BuildDetector:
             "Có thể thêm .debugging-framework.json ngay tại project root cho build system đặc thù."
         )
 
-    def _project_configuration(self, root: Path) -> BuildPlan | None:
-        path, raw = read_project_config_data(root)
+    def _project_configuration(
+        self, root: Path, config_path: Path | None = None
+    ) -> BuildPlan | None:
+        path, raw = (
+            read_project_config_file(config_path)
+            if config_path is not None
+            else read_project_config_data(root)
+        )
         if not raw:
             return None
 
@@ -228,6 +240,13 @@ class BuildDetector:
                     raise ValueError(f"{path}: command {phase}[{index}] không hợp lệ")
                 if not argv or Path(cwd).is_absolute() or ".." in Path(cwd).parts:
                     raise ValueError(f"{path}: command {phase}[{index}] không an toàn")
+                if phase == "regression_test" and any(
+                    "{test_id}" in argument for argument in argv
+                ):
+                    raise ValueError(
+                        f"{path}: regression_test[{index}] phải chạy full suite, "
+                        "không được chứa {test_id}"
+                    )
                 if evidence_pattern or failure_pattern:
                     if phase not in {"test", "target_test", "regression_test"}:
                         raise ValueError(
@@ -255,18 +274,34 @@ class BuildDetector:
         declared_test = commands("test")
         target_test = commands("target_test")
         regression_test = commands("regression_test")
-        effective_test = declared_test or regression_test
+        schema_version = raw.get("schema_version")
+        if schema_version == PROJECT_CONFIG_SCHEMA_VERSION:
+            if declared_test:
+                raise ValueError(
+                    f"{path}: schema_version={PROJECT_CONFIG_SCHEMA_VERSION} "
+                    "không dùng field test; "
+                    "hãy khai báo full suite bằng regression_test"
+                )
+            if not regression_test:
+                raise ValueError(
+                    f"{path}: schema_version={PROJECT_CONFIG_SCHEMA_VERSION} "
+                    "yêu cầu regression_test full suite"
+                )
+            effective_regression = regression_test
+        else:
+            # Keep inspect/validate compatible with older project-local files.
+            # The public repair contract itself requires schema version 6.
+            effective_regression = regression_test or declared_test
         plan = BuildPlan(
             str(raw.get("system") or "project-config"),
             commands("setup"),
             commands("build"),
-            effective_test,
+            effective_regression,
             target_test,
-            regression_test,
         )
-        if not plan.test:
+        if not plan.regression_test:
             raise ValueError(
-                f"{path}: cần ít nhất một test hoặc regression_test command"
+                f"{path}: cần ít nhất một regression_test command"
             )
         return plan
 
@@ -395,9 +430,11 @@ class ProjectValidator:
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def inspect(self, project: Project) -> BuildPlan:
-        plan = self.detector.detect(project.path)
-        if not plan.test:
-            raise ValueError(f"Không tìm thấy test command cho project {project.path}")
+        plan = self.detector.detect(project.path, project.config_path)
+        if not plan.regression_test:
+            raise ValueError(
+                f"Không tìm thấy regression_test full-suite command cho project {project.path}"
+            )
         return plan
 
     def baseline(
@@ -412,7 +449,11 @@ class ProjectValidator:
         """Reproduce the supplied failing test on a clean project snapshot."""
         self._require_artifacts_outside_input(project, artifact_dir)
         with ValidationWorkspace(project) as workspace:
-            snapshot_project = Project(path=workspace.path, project_id=project.project_id)
+            snapshot_project = Project(
+                path=workspace.path,
+                project_id=project.project_id,
+                config_path=project.config_path,
+            )
             plan = self.inspect(snapshot_project)
             plan_digest = self.plan_digest(plan)
             if expected_plan_digest and plan_digest != expected_plan_digest:
@@ -458,11 +499,11 @@ class ProjectValidator:
         failing_tests: tuple[str, ...],
         failure_output: str,
     ) -> dict:
-        """Create baseline evidence supplied by the caller without running tests.
+        """Trust caller evidence without executing the original project.
 
-        The caller is responsible for having run the failing test.  We still
-        inspect the project and resolve the build/environment contract so clean
-        patch validation can be pinned to the same plan and environment digest.
+        Repair validation remains target-first and runs the full regression suite
+        only after the configured target tests pass.  Here we only freeze the
+        declared build/environment contract and initial failing-test IDs.
         """
         self._require_artifacts_outside_input(project, artifact_dir)
         output = str(failure_output or "")
@@ -472,58 +513,56 @@ class ProjectValidator:
         plan_digest = self.plan_digest(plan)
         environment = self.resolve_environment(project, plan)
         target_commands = self._target_commands(plan, failing_tests)
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        output_path = artifact_dir / "baseline-output.txt"
-        output_path.write_text(output, encoding="utf-8", errors="replace")
-        provision = None
-        if environment.backend == "image":
-            provision = self._provision_environment(
-                environment,
-                artifact_dir / "environment",
-            )
+        failed_ids = self._canonical_test_ids(list(failing_tests))
         snapshot = {
             "status": "failing",
             "validation_error": "",
             "validation_executed": False,
-            "baseline_executed": False,
-            "baseline_external": True,
-            "baseline_source": "caller",
-            "baseline_observed": True,
-            "baseline_trust": "caller-supplied",
             "setup_executed": False,
-            "environment_provisioned": False,
             "compile_executed": False,
             "tests_executed": False,
             "build_system": plan.system,
             "build_plan": plan.as_dict(),
             "setup_commands": [],
             "build_commands": [],
-            "test_commands": [item.as_dict() for item in target_commands],
-            "post_passed_tests": [],
-            "post_failed_tests": list(failing_tests),
-            "failed_test_ids": list(failing_tests),
+            "test_commands": [],
+            "failed_test_ids": failed_ids,
             "passed_test_ids": [],
-            "test_id_granularity": "externally-supplied",
+            "post_failed_tests": failed_ids,
+            "post_passed_tests": [],
+            "test_id_granularity": "test-case",
             "failure_output": output,
             "execution_output": output,
-            "validation_process_sandboxed": False,
-            "test_scope": "target",
+            "baseline_external": True,
+            "baseline_source": "caller-log",
+            "baseline_observed": True,
+            "baseline_trust": "caller-supplied-log-and-test-ids",
+            "baseline_reproduced": False,
+            "baseline_executed": False,
+            "baseline_suite_status": "not-run",
+            "baseline_suite_output": "",
+            "baseline_suite_failure_output": "",
+            "test_scope": "caller",
             "target_tests": list(failing_tests),
             "target_commands": [item.as_dict() for item in target_commands],
-            "baseline_output_artifact": str(output_path),
-            "baseline_reproduced": False,
-            "environment_backend": environment.backend,
-            "provisioned_image": getattr(provision, "image", ""),
-            "provisioned_image_digest": getattr(provision, "image_digest", ""),
+            "target_selection_mode": (
+                "configured-target" if target_commands else "full-suite-only"
+            ),
+            "target_executed": False,
+            "target_status": "not-run",
+            "target_passed": None,
+            "regression_executed": False,
+            "regression_status": "not-run",
+            "regression_passed": None,
             "environment": environment.as_dict(),
             "environment_digest": environment.digest,
             "plan_digest": plan_digest,
             "validation_workspace_isolated": False,
+            "validation_process_sandboxed": False,
             "input_project_untouched": True,
             "codex_snapshot_output_file": ".debugging-framework/baseline-output.txt",
         }
-        self._attach_environment_result(snapshot, environment, provision)
-        self._active_backend = ""
+        self._attach_environment_result(snapshot, environment, None)
         return snapshot
 
     def validate_diff(
@@ -570,7 +609,11 @@ class ProjectValidator:
                 )
 
         with ValidationWorkspace(project) as workspace:
-            snapshot_project = Project(path=workspace.path, project_id=project.project_id)
+            snapshot_project = Project(
+                path=workspace.path,
+                project_id=project.project_id,
+                config_path=project.config_path,
+            )
             # Freeze the build/test contract from the clean snapshot. A patch
             # must not be able to select an easier test command by modifying
             # project configuration before auto-detection.
@@ -678,15 +721,21 @@ class ProjectValidator:
         failing_tests: tuple[str, ...],
     ) -> dict:
         target_commands = self._target_commands(plan, failing_tests)
+        active_commands = target_commands or plan.regression_test
         snapshot = self._run_plan(
             root,
             plan,
             artifact_dir,
             prefix="baseline-target",
-            test_commands=target_commands,
+            test_commands=active_commands,
+            test_scope="target" if target_commands else "regression",
         )
         snapshot["target_tests"] = list(failing_tests)
         snapshot["target_commands"] = [item.as_dict() for item in target_commands]
+        snapshot["target_selection_mode"] = (
+            "configured-target" if target_commands else "full-suite-only"
+        )
+        snapshot["target_executed"] = bool(target_commands)
         output_path = artifact_dir / "baseline-output.txt"
         output_path.write_text(
             str(snapshot.get("execution_output") or ""),
@@ -723,49 +772,134 @@ class ProjectValidator:
         failing_tests: tuple[str, ...],
     ) -> dict:
         target_commands = self._target_commands(plan, failing_tests)
+        if not target_commands:
+            regression = self._run_plan(
+                root,
+                plan,
+                artifact_dir,
+                prefix="patched-regression",
+                test_commands=plan.regression_test,
+                test_scope="regression",
+            )
+            regression["target_tests"] = list(failing_tests)
+            regression["target_commands"] = []
+            regression["target_selection_mode"] = "full-suite-only"
+            regression["target_executed"] = False
+            regression["target_status"] = "not-run"
+            regression["target_passed"] = None
+            regression["regression_executed"] = bool(
+                regression.get("tests_executed")
+            )
+            regression["regression_status"] = regression.get("status")
+            regression["regression_passed"] = regression.get("status") == "plausible"
+            return regression
+
         target = self._run_plan(
             root,
             plan,
             artifact_dir,
             prefix="patched-target",
             test_commands=target_commands,
+            test_scope="target",
         )
         target["target_tests"] = list(failing_tests)
         target["target_commands"] = [item.as_dict() for item in target_commands]
+        target["target_selection_mode"] = "configured-target"
+        target["target_executed"] = True
         target["target_status"] = target.get("status")
-        if target.get("status") != "plausible":
-            target["status"] = "failing" if target.get("status") == "failing" else "invalid"
+        if target.get("status") not in {"plausible", "failing"}:
+            target["status"] = "invalid"
             target["validation_error"] = (
-                "target_test_failed" if target["status"] == "failing"
-                else "target_test_invalid:" + str(target.get("validation_error") or "unknown")
+                "target_test_invalid:" + str(target.get("validation_error") or "unknown")
             )
             return target
-        if not self._target_ids_verified(target.get("passed_test_ids", []), failing_tests):
+
+        matched_failed = self._matching_requested_ids(
+            target.get("failed_test_ids", []), failing_tests
+        )
+        matched_passed = self._matching_requested_ids(
+            target.get("passed_test_ids", []), failing_tests
+        )
+        observed_requested = matched_failed | matched_passed
+        if observed_requested != set(failing_tests):
             target["status"] = "invalid"
             target["validation_error"] = "target_test_unverified"
             return target
 
-        regression_commands = plan.regression_test or plan.test
+        target_failed_ids = sorted(matched_failed)
+        target_passed_ids = sorted(set(failing_tests) - matched_failed)
+
+        if target_failed_ids:
+            target["target_passed"] = False
+            target["regression_executed"] = False
+            target["regression_status"] = "not-run"
+            target["regression_passed"] = None
+            target["failed_test_ids"] = target_failed_ids
+            target["passed_test_ids"] = target_passed_ids
+            target["post_failed_tests"] = target_failed_ids
+            target["post_passed_tests"] = target_passed_ids
+            target["test_id_granularity"] = "test-case"
+            return target
+
         regression = self._run_plan(
             root,
             plan,
             artifact_dir,
             prefix="patched-regression",
-            test_commands=regression_commands,
+            test_commands=plan.regression_test,
+            test_scope="regression",
         )
         regression["target_tests"] = list(failing_tests)
         regression["target_commands"] = [item.as_dict() for item in target_commands]
-        regression["target_status"] = "plausible"
-        regression["target_passed"] = True
+        regression["target_status"] = target.get("status")
+        regression["target_passed"] = target.get("status") == "plausible"
+        regression["target_selection_mode"] = "configured-target"
+        regression["target_executed"] = True
         regression["target_output"] = "\n\n".join(
             item.get("output", "") for item in target.get("test_commands", [])
         )
-        if regression.get("status") != "plausible":
+        regression["regression_status"] = regression.get("status")
+        regression["regression_passed"] = regression.get("status") == "plausible"
+        regression["regression_executed"] = bool(regression.get("tests_executed"))
+        if regression.get("status") not in {"plausible", "failing"}:
+            regression["status"] = "invalid"
             regression["validation_error"] = (
-                "regression_failed" if regression.get("status") == "failing"
-                else "regression_invalid:" + str(regression.get("validation_error") or "unknown")
+                "regression_invalid:"
+                + str(regression.get("validation_error") or "unknown")
             )
+            return regression
+
+        regression_failed_ids = self._canonical_test_ids(
+            regression.get("failed_test_ids", [])
+        )
+        regression_passed_ids = self._canonical_test_ids(
+            regression.get("passed_test_ids", [])
+        )
+        failed_ids = sorted(set(target_failed_ids) | set(regression_failed_ids))
+        passed_ids = sorted(
+            (set(target_passed_ids) | set(regression_passed_ids)) - set(failed_ids)
+        )
+        regression["status"] = "failing" if failed_ids else "plausible"
+        regression["validation_error"] = ""
+        regression["failed_test_ids"] = failed_ids
+        regression["passed_test_ids"] = passed_ids
+        regression["post_failed_tests"] = failed_ids
+        regression["post_passed_tests"] = passed_ids
+        regression["test_id_granularity"] = "test-case"
         return regression
+
+    @classmethod
+    def _canonical_test_ids(cls, observed: object) -> list[str]:
+        values: set[str] = set()
+        for raw in observed if isinstance(observed, list) else []:
+            value = cls._canonical_test_id(str(raw))
+            if not value:
+                continue
+            parts = value.split("::")
+            if len(parts) == 2 and parts[0] == parts[1]:
+                value = parts[0]
+            values.add(value)
+        return sorted(values)
 
     @staticmethod
     def _target_ids_verified(observed: object, requested: tuple[str, ...]) -> bool:
@@ -790,13 +924,33 @@ class ProjectValidator:
             for requested_id in requested
         )
 
+    @classmethod
+    def _matching_requested_ids(
+        cls, observed: object, requested: tuple[str, ...]
+    ) -> set[str]:
+        values = [
+            cls._canonical_test_id(str(value))
+            for value in (observed if isinstance(observed, list) else [])
+            if str(value).strip() and not str(value).startswith("command:")
+        ]
+        return {
+            requested_id
+            for requested_id in requested
+            if any(
+                cls._canonical_test_id(requested_id) == value
+                or cls._canonical_test_id(requested_id).endswith(value)
+                or value.endswith(cls._canonical_test_id(requested_id))
+                for value in values
+            )
+        }
+
     @staticmethod
     def _canonical_test_id(value: str) -> str:
         return str(value).strip().replace("#", "::")
 
     @staticmethod
     def _target_commands(plan: BuildPlan, failing_tests: tuple[str, ...]) -> tuple[CommandSpec, ...]:
-        """Turn user-facing test IDs into runner-specific target commands."""
+        """Resolve only the optional target command declared by the partner."""
         selectors = tuple(str(value).strip() for value in failing_tests if str(value).strip())
         if plan.target_test:
             commands: list[CommandSpec] = []
@@ -816,28 +970,7 @@ class ProjectValidator:
                         failure_pattern=spec.failure_pattern,
                     ))
             return tuple(commands)
-        if not selectors:
-            return plan.test
-        system = plan.system.strip().lower()
-        commands: list[CommandSpec] = []
-        for spec in plan.test:
-            argv = list(spec.argv)
-            command_text = " ".join(argv)
-            if system == "cmake" or "ctest" in command_text:
-                argv.extend(["-R", "|".join(re.escape(item) for item in selectors)])
-            else:
-                # For custom runners, executing the declared command is safer
-                # than inventing shell syntax.  The report/output evidence is
-                # still required by the normal validator.
-                pass
-            commands.append(CommandSpec(
-                label=f"target-{spec.label}",
-                argv=tuple(argv),
-                cwd=spec.cwd,
-                evidence_pattern=spec.evidence_pattern,
-                failure_pattern=spec.failure_pattern,
-            ))
-        return tuple(commands)
+        return ()
 
     @staticmethod
     def _require_artifacts_outside_input(project: Project, artifact_dir: Path) -> None:
@@ -856,6 +989,7 @@ class ProjectValidator:
         artifact_dir: Path,
         prefix: str,
         test_commands: Iterable[CommandSpec] | None = None,
+        test_scope: str = "regression",
     ) -> dict:
         setup = self._run_commands(root, plan.setup, artifact_dir, f"{prefix}-setup")
         if not all(item.ok for item in setup):
@@ -863,7 +997,9 @@ class ProjectValidator:
         build = self._run_commands(root, plan.build, artifact_dir, f"{prefix}-build")
         if not all(item.ok for item in build):
             return self._snapshot(plan, setup, build, [], "invalid", "build_failed")
-        active_tests = tuple(test_commands or plan.test)
+        active_tests = tuple(
+            plan.regression_test if test_commands is None else test_commands
+        )
         reports_before = self._test_report_state(root)
         tests = self._run_commands(root, active_tests, artifact_dir, f"{prefix}-test")
         if not tests:
@@ -931,7 +1067,7 @@ class ProjectValidator:
         tests_ok = all(item.ok for item in tests)
         status = "plausible" if tests_ok else "failing"
         value = snapshot(status, "")
-        value["test_scope"] = "target" if test_commands is not None else "regression"
+        value["test_scope"] = test_scope
         value["test_commands"] = [item.as_dict() for item in active_tests]
         return value
 

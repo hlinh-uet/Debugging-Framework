@@ -259,6 +259,8 @@ class ProjectWorkspace:
         self._run_git("config", "user.email", "debugging-framework@example.invalid", timeout=30)
         (self.path / ".git" / "info" / "exclude").write_text(
             "node_modules/\n.venv/\nvenv/\ntarget/\nbuild/\ndist/\n"
+            ".codegraph/\n"
+            "codegraph.json\n"
             ".debugging-framework/build/\n.debugging-framework/environment/\n"
             ".debugging-framework/venv/\n.debugging-framework/bundle/\n"
             ".debugging-framework/baseline-output.txt\n",
@@ -294,7 +296,10 @@ class ProjectWorkspace:
             }
         }
         if relative == Path("."):
-            ignored.update(name for name in names if name in {".git", ".env", "build", "dist", "target"})
+            ignored.update(
+                name for name in names
+                if name in {".git", ".env", ".codegraph", "build", "dist", "target"}
+            )
         elif ".git" in names:
             ignored.add(".git")
         if relative.as_posix() == ".debugging-framework":

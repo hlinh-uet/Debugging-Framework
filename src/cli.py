@@ -16,18 +16,21 @@ from src.core.pipeline import (
     PipelineOptions,
     classify_validation_result,
 )
+from src.core.context_layer import CodeGraphBackend
 from src.loaders.project import ProjectLoader
 from src.utils.config import FrameworkConfig, Settings
 from src.utils.jsonio import atomic_write_json, atomic_write_text, safe_name
 from src.utils.project_config import (
     PROJECT_CONFIG_NAME,
+    PROJECT_CONFIG_SCHEMA_VERSION,
     ProjectConfig,
     load_project_config,
+    load_project_config_file,
     read_project_config_data,
     repair_config_template,
 )
 from src.utils.workspace import ProjectWorkspace
-from src.validation.project import ProjectValidator
+from src.validation.project import BuildDetector, CommandSpec, ProjectValidator
 
 
 def build_parser(config: FrameworkConfig | None = None) -> argparse.ArgumentParser:
@@ -59,7 +62,7 @@ def build_parser(config: FrameworkConfig | None = None) -> argparse.ArgumentPars
     sub = parser.add_subparsers(dest="command", required=True)
 
     inspect_parser = sub.add_parser(
-        "inspect", help="Tự nhận diện provisioning/build/test plan, chưa chạy lệnh."
+        "inspect", help="Xem build/full-suite contract hoặc plan tự nhận diện, chưa chạy lệnh."
     )
     inspect_parser.add_argument(
         "project", type=Path, nargs="?",
@@ -73,8 +76,12 @@ def build_parser(config: FrameworkConfig | None = None) -> argparse.ArgumentPars
         help="FL/APR trên snapshot từ failure evidence đã cung cấp.",
     )
     repair_parser.add_argument(
+        "--project", type=Path, default=argparse.SUPPRESS,
+        help="Path to the buggy project directory.",
+    )
+    repair_parser.add_argument(
         "--config", dest="project_config", type=Path, default=argparse.SUPPRESS,
-        help="Path to the required .debugging-framework.json input contract.",
+        help="Path to the independent Debugging-Framework input contract JSON.",
     )
     repair_parser.add_argument(
         "--failing-output", "--failure-output", "--baseline-output",
@@ -97,11 +104,15 @@ def build_parser(config: FrameworkConfig | None = None) -> argparse.ArgumentPars
     add_environment_options(validate_parser)
 
     doctor_parser = sub.add_parser(
-        "doctor", help="Kiểm tra Codex, prepared environment và build/test auto-detection."
+        "doctor", help="Kiểm tra Codex, environment và build/full-suite contract."
     )
     doctor_parser.add_argument(
         "project", type=Path, nargs="?",
         help="Project root; mặc định là thư mục hiện tại.",
+    )
+    doctor_parser.add_argument(
+        "--config", dest="project_config", type=Path, default=argparse.SUPPRESS,
+        help="Optional independent Debugging-Framework input contract JSON.",
     )
     doctor_parser.add_argument("--jobs", type=int, default=argparse.SUPPRESS)
     add_environment_options(doctor_parser)
@@ -163,15 +174,19 @@ def add_repair_options(
 
 
 def _prepare_repair_file_inputs(args: argparse.Namespace) -> None:
-    """Resolve the strict two-file repair contract before loading the project."""
+    """Resolve the strict three-path repair contract before loading the project."""
     if args.command != "repair":
         return
+    project = getattr(args, "project", None)
+    if project is None:
+        raise ValueError("repair cần --project /path/to/buggy-project")
+    project = project.expanduser().resolve()
+    if not project.is_dir():
+        raise FileNotFoundError(f"Project không tồn tại hoặc không phải thư mục: {project}")
     configured = getattr(args, "project_config", None)
     if configured is None:
-        raise ValueError("repair cần --config /path/to/.debugging-framework.json")
+        raise ValueError("repair cần --config /path/to/project-config.json")
     configured = configured.expanduser()
-    if configured.name != PROJECT_CONFIG_NAME:
-        raise ValueError(f"--config phải trỏ tới file có tên {PROJECT_CONFIG_NAME}")
     if configured.is_symlink():
         raise ValueError("--config không được là symlink")
     configured = configured.resolve()
@@ -183,7 +198,7 @@ def _prepare_repair_file_inputs(args: argparse.Namespace) -> None:
         raise ValueError("repair cần --failure-output /path/to/failure_output.log")
     if str(failure_output) == "-":
         raise ValueError(
-            "repair contract hai file không hỗ trợ stdin; "
+            "repair contract ba path không hỗ trợ stdin; "
             "--failure-output phải là path tới file"
         )
     failure_output = failure_output.expanduser()
@@ -195,8 +210,7 @@ def _prepare_repair_file_inputs(args: argparse.Namespace) -> None:
     if failure_output == configured:
         raise ValueError("--config và --failure-output phải là hai file khác nhau")
 
-    inferred_project = configured.parent.resolve()
-    args.project = inferred_project
+    args.project = project
     args.project_config = configured
     args.failing_output = failure_output
     try:
@@ -212,9 +226,10 @@ def _validate_repair_config_contract(
     """Make the project config authoritative for tests and environment."""
     if args.command != "repair":
         return
-    if project_config.raw.get("schema_version") != 5:
+    if project_config.raw.get("schema_version") != PROJECT_CONFIG_SCHEMA_VERSION:
         raise ValueError(
-            f"{project_config.path}: repair contract yêu cầu schema_version=5"
+            f"{project_config.path}: repair contract yêu cầu "
+            f"schema_version={PROJECT_CONFIG_SCHEMA_VERSION}"
         )
     disallowed_overrides = {
         "failing_tests": "--failing-test/--test-id",
@@ -225,7 +240,7 @@ def _validate_repair_config_contract(
     used = [flag for field, flag in disallowed_overrides.items() if hasattr(args, field)]
     if used:
         raise ValueError(
-            "Hai-file repair contract yêu cầu test/environment nằm trong --config; "
+            "Ba-path repair contract yêu cầu test/environment nằm trong --config; "
             "không dùng CLI override: " + ", ".join(used)
         )
     if not project_config.repair.failing_tests:
@@ -235,6 +250,16 @@ def _validate_repair_config_contract(
     if not project_config.environment.mode:
         raise ValueError(
             f"{project_config.path}: environment.mode là bắt buộc (host hoặc image)"
+        )
+    regression = project_config.raw.get("regression_test")
+    if not regression or not isinstance(regression, (str, dict, list)):
+        raise ValueError(
+            f"{project_config.path}: regression_test full suite là bắt buộc"
+        )
+    if "test" in project_config.raw:
+        raise ValueError(
+            f"{project_config.path}: field test không còn dùng trong schema "
+            f"{PROJECT_CONFIG_SCHEMA_VERSION}; hãy dùng regression_test"
         )
 
 
@@ -372,12 +397,17 @@ def main(argv: list[str] | None = None) -> int:
         _prepare_repair_file_inputs(args)
         if args.command in {"inspect", "doctor", "init"} and getattr(args, "project", None) is None:
             args.project = Path.cwd()
-        project = ProjectLoader().load(args.project)
+        explicit_config = getattr(args, "project_config", None)
+        project = ProjectLoader().load(args.project, config_path=explicit_config)
 
         if args.command == "init":
             return init_project(project, args, config)
 
-        project_config = load_project_config(project.path)
+        project_config = (
+            load_project_config_file(explicit_config)
+            if explicit_config is not None
+            else load_project_config(project.path)
+        )
         _validate_repair_config_contract(args, project_config)
         apply_effective_options(args, config, project_config)
         settings = Settings(
@@ -391,6 +421,9 @@ def main(argv: list[str] | None = None) -> int:
             environment_backend=args.environment_backend,
             environment_runtime=args.environment_runtime,
             environment_image=args.environment_image,
+            context_mode=config.context_mode,
+            codegraph_executable=config.codegraph_executable,
+            codegraph_timeout_seconds=config.codegraph_timeout_seconds,
         ).validated()
 
         if args.command == "inspect":
@@ -453,7 +486,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def init_project(project, args: argparse.Namespace, config: FrameworkConfig) -> int:
-    """Create or update only the runtime portion of a project config."""
+    """Create/update an explicit build and full-suite partner contract."""
     # Parse first so init never silently preserves a malformed environment or
     # build/test contract. Existing command fields are intentionally retained.
     existing_config = load_project_config(project.path)
@@ -511,9 +544,23 @@ def init_project(project, args: argparse.Namespace, config: FrameworkConfig) -> 
     merged = dict(raw)
     merged["schema_version"] = template["schema_version"]
     merged["repair"] = template["repair"]
+    merged.pop("test", None)
     # Do not overwrite an operator-provided environment, even with --force.
     if "environment" not in merged:
         merged["environment"] = template["environment"]
+    if not merged.get("regression_test"):
+        detected = BuildDetector(jobs=config.jobs).detect(project.path)
+        merged["system"] = detected.system
+        merged["setup"] = [
+            _command_contract_value(command) for command in detected.setup
+        ]
+        merged["build"] = [
+            _command_contract_value(command) for command in detected.build
+        ]
+        merged["regression_test"] = [
+            _command_contract_value(command)
+            for command in detected.regression_test
+        ]
     atomic_write_json(config_path, merged)
 
     _create_failure_output_parent(project.path, failure_output)
@@ -528,11 +575,30 @@ def init_project(project, args: argparse.Namespace, config: FrameworkConfig) -> 
         "gitignore_updated": gitignore_updated,
         "next": (
             "Ghi actual output vào failure_output rồi chạy: "
-            f"debugging-framework repair --config {config_path} "
+            f"debugging-framework repair --project {project.path} --config {config_path} "
             f"--failure-output {failure_path}"
         ),
     }, indent=2, ensure_ascii=False))
     return 0
+
+
+def _command_contract_value(command: CommandSpec):
+    """Serialize a detected command into the user-editable JSON contract."""
+    if (
+        command.cwd == "."
+        and not command.evidence_pattern
+        and not command.failure_pattern
+    ):
+        return list(command.argv)
+    value: dict[str, object] = {
+        "command": list(command.argv),
+        "cwd": command.cwd,
+    }
+    if command.evidence_pattern:
+        value["evidence_pattern"] = command.evidence_pattern
+    if command.failure_pattern:
+        value["failure_pattern"] = command.failure_pattern
+    return value
 
 
 def _portable_failure_output(value: Path | str, root: Path) -> str:
@@ -762,6 +828,19 @@ def doctor(settings: Settings, project, jobs: int) -> int:
     else:
         failures += 1
         print(f"[FAIL] Không tìm thấy Codex CLI: {settings.codex_executable}")
+    context = CodeGraphBackend.from_settings(settings).probe()
+    if context.mode == "off":
+        print("[OK] CodeGraph context: disabled")
+    elif context.ready:
+        print(
+            f"[OK] CodeGraph context: {context.version or 'unknown'} "
+            f"({context.target or 'external'})"
+        )
+    elif context.mode == "required":
+        failures += 1
+        print(f"[FAIL] CodeGraph context: {context.error}")
+    else:
+        print(f"[WARN] CodeGraph context unavailable; Codex fallback active: {context.error}")
     try:
         plan = validator.inspect(project)
         environment = validator.resolve_environment(project, plan)
@@ -775,7 +854,6 @@ def doctor(settings: Settings, project, jobs: int) -> int:
             *plan.build,
             *plan.target_test,
             *plan.regression_test,
-            *plan.test,
         ):
             if image_backend:
                 state = "READY" if prepared_environment_ready else "BLOCKED"
@@ -823,7 +901,7 @@ def _print_plan(project: Path, plan: dict, environment: dict | None = None) -> N
     if environment:
         print(f"environment_backend: {environment['backend']}")
         print(f"environment_digest: {environment['digest']}")
-    for phase in ("setup", "build", "target_test", "regression_test", "test"):
+    for phase in ("setup", "build", "target_test", "regression_test"):
         for item in plan.get(phase, []):
             print(f"{phase}: (cwd={item['cwd']}) {' '.join(item['argv'])}")
 

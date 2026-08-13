@@ -18,6 +18,7 @@ from typing import Any
 
 
 PROJECT_CONFIG_NAME = ".debugging-framework.json"
+PROJECT_CONFIG_SCHEMA_VERSION = 6
 ENVIRONMENT_MODES = frozenset({"host", "image"})
 
 
@@ -58,7 +59,12 @@ def project_config_path(root: Path) -> Path:
 
 def read_project_config_data(root: Path) -> tuple[Path, dict[str, Any]]:
     """Read the raw project config without interpreting its build/test fields."""
-    path = project_config_path(root)
+    return read_project_config_file(project_config_path(root))
+
+
+def read_project_config_file(path: Path) -> tuple[Path, dict[str, Any]]:
+    """Read a project contract from an explicit path."""
+    path = path.expanduser().resolve()
     if not path.is_file():
         return path, {}
     try:
@@ -71,7 +77,11 @@ def read_project_config_data(root: Path) -> tuple[Path, dict[str, Any]]:
 
 
 def load_project_config(root: Path) -> ProjectConfig:
-    path, raw = read_project_config_data(root)
+    return load_project_config_file(project_config_path(root))
+
+
+def load_project_config_file(path: Path) -> ProjectConfig:
+    path, raw = read_project_config_file(path)
     return ProjectConfig(
         path=path,
         raw=raw,
@@ -87,13 +97,13 @@ def repair_config_template(
     environment_runtime: str = "auto",
     environment_image: str = "",
 ) -> dict[str, Any]:
-    """Return a minimal config that preserves native build auto-detection."""
+    """Return the runtime portion of the explicit partner contract."""
     environment: dict[str, str] = {"mode": environment_mode}
     if environment_mode == "image":
         environment["runtime"] = environment_runtime
         environment["image"] = environment_image
     return {
-        "schema_version": 5,
+        "schema_version": PROJECT_CONFIG_SCHEMA_VERSION,
         "repair": {
             "failing_tests": list(failing_tests),
             "attempts": 2,

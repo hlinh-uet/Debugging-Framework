@@ -10,6 +10,7 @@ class Project:
 
     path: Path
     project_id: str
+    config_path: Path | None = None
 
 
 class ProjectLoader:
@@ -21,8 +22,14 @@ class ProjectLoader:
     valid custom projects before their explicit project contract could be read.
     """
 
-    def load(self, project_path: Path | None = None) -> Project:
+    def load(
+        self,
+        project_path: Path | None = None,
+        *,
+        config_path: Path | None = None,
+    ) -> Project:
         path = (project_path or Path.cwd()).expanduser().resolve()
         if not path.is_dir():
             raise FileNotFoundError(f"Project không tồn tại hoặc không phải thư mục: {path}")
-        return Project(path=path, project_id=path.name)
+        resolved_config = config_path.expanduser().resolve() if config_path else None
+        return Project(path=path, project_id=path.name, config_path=resolved_config)

@@ -22,6 +22,8 @@ KNOWN_ENV_KEYS = {
     "DEBUGGING_INHERIT_CODEX_CONFIG", "DEBUGGING_RESULTS_DIR",
     "DEBUGGING_ENVIRONMENT_BACKEND", "DEBUGGING_ENVIRONMENT_RUNTIME",
     "DEBUGGING_ENVIRONMENT_IMAGE",
+    "DEBUGGING_CONTEXT_MODE", "DEBUGGING_CODEGRAPH_BIN",
+    "DEBUGGING_CODEGRAPH_TIMEOUT",
 }
 
 
@@ -100,6 +102,13 @@ def _path(raw: str, default: Path) -> Path:
     return value.resolve()
 
 
+def _choice(name: str, raw: str, allowed: set[str]) -> str:
+    value = raw.lower().strip()
+    if value not in allowed:
+        raise ValueError(f"{name} phải là một trong: {', '.join(sorted(allowed))}")
+    return value
+
+
 @dataclass(frozen=True)
 class FrameworkConfig:
     env_file: Path = DEFAULT_ENV_FILE
@@ -122,6 +131,9 @@ class FrameworkConfig:
     environment_backend: str = ""
     environment_runtime: str = "auto"
     environment_image: str = ""
+    context_mode: str = "auto"
+    codegraph_executable: str = ""
+    codegraph_timeout_seconds: int = 180
 
     @classmethod
     def load(
@@ -157,6 +169,17 @@ class FrameworkConfig:
             environment_backend=get("DEBUGGING_ENVIRONMENT_BACKEND", ""),
             environment_runtime=get("DEBUGGING_ENVIRONMENT_RUNTIME", "auto"),
             environment_image=get("DEBUGGING_ENVIRONMENT_IMAGE", ""),
+            context_mode=_choice(
+                "DEBUGGING_CONTEXT_MODE",
+                get("DEBUGGING_CONTEXT_MODE", "auto"),
+                {"off", "auto", "required"},
+            ),
+            codegraph_executable=get("DEBUGGING_CODEGRAPH_BIN", ""),
+            codegraph_timeout_seconds=_int(
+                "DEBUGGING_CODEGRAPH_TIMEOUT",
+                get("DEBUGGING_CODEGRAPH_TIMEOUT", "180"),
+                1,
+            ),
         )
 
 
@@ -172,6 +195,9 @@ class Settings:
     environment_backend: str = ""
     environment_runtime: str = "auto"
     environment_image: str = ""
+    context_mode: str = "auto"
+    codegraph_executable: str = ""
+    codegraph_timeout_seconds: int = 180
 
     @property
     def output_schema(self) -> Path:
@@ -193,6 +219,10 @@ class Settings:
             )
         if self.environment_backend == "host" and self.environment_image.strip():
             raise ValueError("--environment-image chỉ được dùng với environment image")
+        if self.context_mode not in {"off", "auto", "required"}:
+            raise ValueError("Context mode chỉ hỗ trợ off, auto hoặc required")
+        if self.codegraph_timeout_seconds < 1:
+            raise ValueError("CodeGraph timeout phải >= 1")
         return Settings(
             results_dir=self.results_dir.expanduser().resolve(),
             codex_executable=self.codex_executable,
@@ -204,4 +234,7 @@ class Settings:
             environment_backend=self.environment_backend,
             environment_runtime=self.environment_runtime,
             environment_image=self.environment_image.strip(),
+            context_mode=self.context_mode,
+            codegraph_executable=self.codegraph_executable.strip(),
+            codegraph_timeout_seconds=self.codegraph_timeout_seconds,
         )

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "debugging-framework"
-version = "0.5.0"
+version = "0.7.0"
 description = "Automated C/C++ fault-localization and validated patch repair driven by Codex CLI"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,24 +12,30 @@ requires-python = ">=3.10"
 [project.scripts]
 debugging-framework = "debugging_framework.cli:main"
 
-[project.optional-dependencies]
-test = ["pytest>=8.0"]
-
 [tool.setuptools.package-data]
 src = ["schemas/*.json"]
+
+[tool.setuptools.data-files]
+"share/debugging-framework/codegraph" = [
+  "third_party/codegraph/manifest.json",
+  "third_party/codegraph/LICENSE",
+  "third_party/codegraph/THIRD_PARTY_NOTICES.md",
+  "third_party/codegraph/README.md",
+]
+"share/debugging-framework/codegraph/archives" = [
+  "third_party/codegraph/archives/codegraph-darwin-arm64.tar.gz",
+  "third_party/codegraph/archives/codegraph-linux-x64.tar.gz",
+]
 
 [tool.setuptools]
 packages = [
   "debugging_framework",
   "src",
   "src.core",
+  "src.core.context_layer",
   "src.loaders",
   "src.schemas",
   "src.utils",
   "src.validation",
   "src.environments",
 ]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-q"

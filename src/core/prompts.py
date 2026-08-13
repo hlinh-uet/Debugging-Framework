@@ -18,6 +18,7 @@ def build_codex_prompt(
     failing_tests: list[str] | tuple[str, ...] | None = None,
     previous_attempt: Optional[dict] = None,
     baseline: Optional[dict] = None,
+    repository_context: str = "",
 ) -> str:
     failing_tests = tuple(
         str(value).strip() for value in (failing_tests or ()) if str(value).strip()
@@ -121,12 +122,19 @@ def build_codex_prompt(
         "This is a disposable, writable snapshot of the input project. The framework has "
         "copied the entire project, including source, tests, manifests, lockfiles and documentation."
     )
+    repository_context = str(repository_context or "").strip()
+    repository_navigation = (
+        "\nRepository navigation aid:\n" + repository_context + "\n"
+        if repository_context
+        else ""
+    )
     return f"""You are a software engineer performing fault localization and program repair.
 {workspace_description} {workflow_context}
 The framework will extract your patch and independently validate it on fresh copies.
 
 {investigation_context}
 {known_failure}
+{repository_navigation}
 Then investigate production source, callers, callees, data flow, error paths, and
 invariants; implement and test the smallest root-cause repair.
 

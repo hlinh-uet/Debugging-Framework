@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from src.core.codex_runner import CodexRunner
+from src.core.context_layer import CodeGraphBackend
 from src.core.prompts import build_codex_prompt
-from src.utils.jsonio import atomic_write_bytes, atomic_write_json, atomic_write_text, safe_name
+from src.utils.jsonio import atomic_write_json, atomic_write_text, safe_name
 from src.utils.workspace import (
     ProjectWorkspace,
     normalize_relpath,
@@ -45,10 +46,18 @@ class PipelineOptions:
 class DebuggingPipeline:
     """Project-in repair pipeline with raw diff retention and isolated validation."""
 
-    def __init__(self, *, settings, validator, runner_factory=CodexRunner):
+    def __init__(
+        self,
+        *,
+        settings,
+        validator,
+        runner_factory=CodexRunner,
+        context_factory=CodeGraphBackend,
+    ):
         self.settings = settings
         self.validator = validator
         self.runner_factory = runner_factory
+        self.context_factory = context_factory
 
     def run(self, project, options: PipelineOptions, output_patch: Path | None = None) -> dict:
         self._validate_request(options)
@@ -59,32 +68,15 @@ class DebuggingPipeline:
         output_patch = (output_patch or (project_results / "patch.diff")).expanduser().resolve()
         self._require_outside_input(project_root, project_results, "results")
         self._require_outside_input(project_root, output_patch, "patch output")
-        project_results.mkdir(parents=True, exist_ok=True)
+        self._verify_file_inputs(options)
+        self._prepare_project_results(project_results)
         self._prepare_output_target(output_patch)
 
-        input_artifacts = self._archive_file_inputs(project_results, options)
-
-        manifest = {
-            "framework": "debugging-framework-project-repair",
-            "version": 8,
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "project": str(project.path),
-            "project_id": project.project_id,
-            "attempts": options.attempts,
-            "model": options.model or "codex-cli-default",
-            "failing_tests": list(options.failing_tests),
-            "output_patch": str(output_patch),
-            "baseline_source": "caller",
-            "codex_workspace": "snapshot",
-            "inputs": input_artifacts,
-        }
-        atomic_write_json(project_results / "run_manifest.json", manifest)
-
-        print("[baseline] dùng output do caller cung cấp; bỏ qua chạy lại failing test")
+        print("[baseline] dùng failure log và test ID do caller cung cấp; không chạy source gốc")
         try:
             baseline_snapshot = self.validator.external_baseline(
                 project,
-                project_results / "baseline",
+                project_results / ".baseline-transient",
                 failing_tests=options.failing_tests,
                 failure_output=options.external_baseline_output,
             )
@@ -92,21 +84,6 @@ class DebuggingPipeline:
             baseline_snapshot = self.validator.invalid_snapshot(
                 f"external_baseline_exception:{type(exc).__name__}:{exc}"
             )
-        baseline_output_path = project_results / "baseline" / "baseline-output.txt"
-        if baseline_output_path.is_file():
-            baseline_snapshot["baseline_output_artifact"] = str(
-                baseline_output_path.relative_to(project_results)
-            )
-            baseline_snapshot["codex_snapshot_output_file"] = (
-                ".debugging-framework/baseline-output.txt"
-            )
-        atomic_write_json(project_results / "baseline.json", baseline_snapshot)
-        manifest["baseline"] = {
-            "status": baseline_snapshot.get("status"),
-            "validation_error": baseline_snapshot.get("validation_error", ""),
-            "plan_digest": baseline_snapshot.get("plan_digest", ""),
-            "environment_digest": baseline_snapshot.get("environment_digest", ""),
-        }
         if (
             baseline_snapshot.get("status") != "failing"
             or not baseline_snapshot.get("baseline_external", False)
@@ -124,7 +101,7 @@ class DebuggingPipeline:
                 "attempts": [],
                 "fault_localization": {},
             }
-            return self._finish(project_results, manifest, result)
+            return self._finish(project_results, result)
 
         runner = self.runner_factory(
             executable=self.settings.codex_executable,
@@ -138,6 +115,7 @@ class DebuggingPipeline:
             timeout_seconds=options.codex_timeout_seconds,
             inherit_user_config=options.inherit_codex_config,
         )
+        context_backend = self.context_factory.from_settings(self.settings)
         attempts: list[dict] = []
         candidates: list[dict] = []
         payloads: list[dict] = []
@@ -147,17 +125,27 @@ class DebuggingPipeline:
             print(f"[attempt {attempt_index}/{options.attempts}] Codex đọc project và tạo patch")
             attempt_dir = project_results / "attempts" / f"attempt_{attempt_index:02d}"
             attempt_dir.mkdir(parents=True, exist_ok=True)
-            prompt = build_codex_prompt(
-                project_id=project.project_id,
-                attempt=attempt_index,
-                failing_tests=options.failing_tests,
-                previous_attempt=previous_feedback,
-                baseline=baseline_snapshot,
-            )
             try:
                 with ProjectWorkspace(project, project_results / "workspaces") as workspace:
                     self._write_baseline_context(workspace, baseline_snapshot)
-                    run = runner.run(workspace=workspace.path, prompt=prompt, artifact_dir=attempt_dir)
+                    context_preparation = context_backend.prepare(
+                        workspace.path,
+                        attempt_dir / "context",
+                    )
+                    prompt = build_codex_prompt(
+                        project_id=project.project_id,
+                        attempt=attempt_index,
+                        failing_tests=options.failing_tests,
+                        previous_attempt=previous_feedback,
+                        baseline=baseline_snapshot,
+                        repository_context=context_preparation.prompt_context(),
+                    )
+                    run = runner.run(
+                        workspace=workspace.path,
+                        prompt=prompt,
+                        artifact_dir=attempt_dir,
+                        tool_directories=context_preparation.tool_directories,
+                    )
                     payload_artifact = attempt_dir / "codex.payload.json"
                     atomic_write_json(payload_artifact, run.payload)
                     base_attempt = {
@@ -166,6 +154,7 @@ class DebuggingPipeline:
                         "codex_error": run.error,
                         "codex_returncode": run.returncode,
                         "elapsed_seconds": round(run.elapsed_seconds, 3),
+                        "repository_context": context_preparation.to_dict(),
                         "response": run.payload,
                         "codex_response_artifact": str(
                             payload_artifact.relative_to(project_results)
@@ -292,7 +281,7 @@ class DebuggingPipeline:
                         result = self._result(
                             project, attempts, candidate, output_patch, payloads
                         )
-                        return self._finish(project_results, manifest, result)
+                        return self._finish(project_results, result)
                     previous_feedback = {
                         "error": snapshot.get("validation_error") or "tests_still_fail",
                         "outcome": snapshot.get("status"),
@@ -362,7 +351,7 @@ class DebuggingPipeline:
                 "attempts": attempts,
                 "fault_localization": self._fault_localization(payloads),
             }
-        return self._finish(project_results, manifest, result)
+        return self._finish(project_results, result)
 
     @staticmethod
     def _write_baseline_context(workspace: ProjectWorkspace, baseline: dict | None) -> None:
@@ -418,6 +407,8 @@ class DebuggingPipeline:
                     "patch_paths",
                     "failed_test_ids", "passed_test_ids", "test_id_granularity",
                     "target_tests", "target_commands", "target_status", "target_passed",
+                    "target_selection_mode", "target_executed",
+                    "regression_executed", "regression_status", "regression_passed",
                     "post_validation_status", "initial_failed_test_ids", "post_failed_test_ids",
                     "fixed_test_ids", "regression_test_ids", "classification_basis_valid",
                     "baseline_reproduced", "environment", "environment_digest", "plan_digest",
@@ -430,16 +421,15 @@ class DebuggingPipeline:
         }
 
     @staticmethod
-    def _archive_file_inputs(project_results: Path, options: PipelineOptions) -> dict:
-        """Persist the exact logical two-file request used by this run."""
-        inputs: dict[str, dict[str, str]] = {}
-        for name, source, artifact_name, expected_sha256 in (
+    def _verify_file_inputs(options: PipelineOptions) -> None:
+        """Verify the two file inputs without duplicating them in the result tree."""
+        for name, source, expected_sha256 in (
             (
-                "config", options.request_config_path, "project-config.json",
+                "config", options.request_config_path,
                 options.request_config_sha256,
             ),
             (
-                "failure_output", options.failure_output_path, "failure-output.log",
+                "failure_output", options.failure_output_path,
                 options.failure_output_sha256,
             ),
         ):
@@ -449,18 +439,10 @@ class DebuggingPipeline:
             try:
                 content = source.read_bytes()
             except OSError as exc:
-                raise RuntimeError(f"Không archive được input {source}: {exc}") from exc
+                raise RuntimeError(f"Không đọc được input {source}: {exc}") from exc
             digest = hashlib.sha256(content).hexdigest()
             if expected_sha256 and digest != expected_sha256:
                 raise RuntimeError(f"input_changed_during_startup:{name}")
-            artifact = project_results / "inputs" / artifact_name
-            atomic_write_bytes(artifact, content)
-            inputs[name] = {
-                "source": str(source),
-                "artifact": str(artifact.relative_to(project_results)),
-                "sha256": digest,
-            }
-        return inputs
 
     @staticmethod
     def _validate_request(options: PipelineOptions) -> None:
@@ -471,15 +453,46 @@ class DebuggingPipeline:
         if not str(options.external_baseline_output or "").strip():
             raise ValueError("repair cần actual failing output không rỗng")
         if options.request_config_path is None or options.failure_output_path is None:
-            raise ValueError("repair cần đúng hai input file config và failure output")
+            raise ValueError("repair cần project, config và failure output")
 
     @staticmethod
-    def _finish(project_results: Path, manifest: dict, result: dict) -> dict:
-        manifest["completed_at"] = datetime.now(timezone.utc).isoformat()
-        manifest["status"] = result.get("status")
-        atomic_write_json(project_results / "run_manifest.json", manifest)
+    def _finish(project_results: Path, result: dict) -> dict:
+        DebuggingPipeline._cleanup_transient_result_artifacts(project_results)
         atomic_write_json(project_results / "result.json", result)
         return result
+
+    @staticmethod
+    def _prepare_project_results(project_results: Path) -> None:
+        """Start a repair case with no artifacts left over from an older run."""
+        project_results.mkdir(parents=True, exist_ok=True)
+        for name in (
+            "attempts",
+            "baseline",
+            "inputs",
+            "workspaces",
+            "baseline.json",
+            "run_manifest.json",
+            "result.json",
+        ):
+            DebuggingPipeline._remove_result_entry(project_results / name)
+
+    @staticmethod
+    def _cleanup_transient_result_artifacts(project_results: Path) -> None:
+        for name in (
+            "baseline",
+            "inputs",
+            "workspaces",
+            "baseline.json",
+            "run_manifest.json",
+        ):
+            DebuggingPipeline._remove_result_entry(project_results / name)
+
+    @staticmethod
+    def _remove_result_entry(path: Path) -> None:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
 
     @staticmethod
     def _require_outside_input(project_root: Path, target: Path, label: str) -> None:

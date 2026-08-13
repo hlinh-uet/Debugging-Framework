@@ -1,0 +1,6 @@
+include third_party/codegraph/manifest.json
+include third_party/codegraph/LICENSE
+include third_party/codegraph/THIRD_PARTY_NOTICES.md
+include third_party/codegraph/README.md
+include third_party/codegraph/archives/codegraph-darwin-arm64.tar.gz
+include third_party/codegraph/archives/codegraph-linux-x64.tar.gz

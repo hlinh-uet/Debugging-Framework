@@ -116,6 +116,37 @@ class OCIEnvironment:
         # and user commands untouched.
         if container_argv and Path(container_argv[0]).resolve() == Path(sys.executable).resolve():
             container_argv[0] = "python3"
+        if sys.platform == "darwin":
+            # Docker Desktop bind mounts do not always preserve POSIX access(2)
+            # semantics even when stat(2) reports the expected mode.  Some C/C++
+            # suites test permissions directly and otherwise fail only on macOS.
+            # Execute from the container's native Linux filesystem, then copy
+            # build/test artifacts back so subsequent commands see the same tree.
+            native_root = "/tmp/debugging-framework-workspace"
+            native_cwd = (
+                native_root
+                if relative_cwd == "."
+                else native_root + "/" + relative_cwd
+            )
+            wrapper = (
+                'workspace="/tmp/debugging-framework-workspace"; '
+                'mkdir -p "$workspace" || exit $?; '
+                'cp -a /input/. "$workspace"/ || exit $?; '
+                'cd "$1" || exit $?; shift; '
+                '"$@"; command_status=$?; '
+                'cd /tmp || exit $?; '
+                'cp -a "$workspace"/. /input/; copy_status=$?; '
+                '[ "$copy_status" -eq 0 ] || exit "$copy_status"; '
+                'exit "$command_status"'
+            )
+            return [
+                provision.runtime, "run", "--rm", "--network=none",
+                "--user", f"{os.getuid()}:{os.getgid()}",
+                "-v", f"{root.resolve()}:/input:rw",
+                "-w", "/tmp", provision.image,
+                "sh", "-c", wrapper, "debugging-framework",
+                native_cwd, *container_argv,
+            ]
         return [
             provision.runtime, "run", "--rm", "--network=none",
             "--user", f"{os.getuid()}:{os.getgid()}",

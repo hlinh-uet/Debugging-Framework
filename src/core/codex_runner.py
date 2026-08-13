@@ -48,7 +48,14 @@ class CodexRunner:
         self.timeout_seconds = timeout_seconds
         self.inherit_user_config = inherit_user_config
 
-    def run(self, *, workspace: Path, prompt: str, artifact_dir: Path) -> CodexRunResult:
+    def run(
+        self,
+        *,
+        workspace: Path,
+        prompt: str,
+        artifact_dir: Path,
+        tool_directories: tuple[Path, ...] = (),
+    ) -> CodexRunResult:
         artifact_dir.mkdir(parents=True, exist_ok=True)
         prompt_path = artifact_dir / "prompt.txt"
         events_path = artifact_dir / "events.jsonl"
@@ -112,6 +119,24 @@ class CodexRunner:
 
         started = time.monotonic()
         process_env = os.environ.copy()
+        resolved_tool_directories = [
+            str(path.expanduser().resolve())
+            for path in tool_directories
+            if path.expanduser().resolve().is_dir()
+        ]
+        if resolved_tool_directories:
+            process_env["PATH"] = os.pathsep.join(
+                [*resolved_tool_directories, process_env.get("PATH", "")]
+            )
+            # Scope these controls to context-enabled attempts so context=off
+            # preserves the exact legacy Codex process environment.
+            process_env.update({
+                "CODEGRAPH_TELEMETRY": "0",
+                "DO_NOT_TRACK": "1",
+                "CODEGRAPH_NO_DOWNLOAD": "1",
+                "CODEGRAPH_NO_WATCH": "1",
+                "CODEGRAPH_NO_DAEMON": "1",
+            })
         if self.api_key:
             # The key is scoped to `codex exec`; never place it in the command
             # list or any result artifact. The provider's env_key controls the
