@@ -233,11 +233,6 @@ def _validate_payload(payload: object) -> str:
         or any(not isinstance(path, str) or not path.strip() for path in paths)
     ):
         return "codex_response_missing_repair_paths"
-    diff = (payload.get("repair") or {}).get("diff")
-    if not isinstance(diff, str) or not diff.strip():
-        return "codex_response_missing_repair_diff"
-    if not diff.startswith(("--- a/", "diff --git a/")) or "\n+++ b/" not in diff:
-        return "codex_response_invalid_repair_diff_format"
     return ""
 
 

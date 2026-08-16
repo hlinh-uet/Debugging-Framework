@@ -464,7 +464,7 @@ def main(argv: list[str] | None = None) -> int:
                 "patch_validation_passed": result.get("patch_validation_passed", False),
                 "test_oracle_modified": result.get("test_oracle_modified", False),
                 "blocked_patch_paths": result.get("blocked_patch_paths", []),
-                "llm_patch_artifact": result.get("llm_patch_artifact", ""),
+                "workspace_patch_artifact": result.get("workspace_patch_artifact", ""),
                 "repair_paths": result.get("repair_paths", []),
                 "validation_error": result.get("validation_error", ""),
             }, indent=2, ensure_ascii=False))

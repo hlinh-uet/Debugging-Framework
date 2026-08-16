@@ -9,6 +9,7 @@ import signal
 import subprocess
 import time
 import xml.etree.ElementTree as ET
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -22,6 +23,7 @@ from src.utils.project_config import (
     read_project_config_file,
 )
 from src.utils.workspace import (
+    ProjectWorkspace,
     ValidationWorkspace,
     non_repairable_patch_paths,
     normalize_relpath,
@@ -577,6 +579,7 @@ class ProjectValidator:
         expected_plan_digest: str = "",
         expected_environment_digest: str = "",
         expected_image_digest: str = "",
+        reusable_workspace: ProjectWorkspace | None = None,
     ) -> dict:
         self._require_artifacts_outside_input(project, artifact_dir)
         normalized_paths = [normalize_relpath(path) for path in patch_paths]
@@ -608,7 +611,14 @@ class ProjectValidator:
                     f"input_path_changed_since_llm_snapshot:{normalized}"
                 )
 
-        with ValidationWorkspace(project) as workspace:
+        workspace_context = (
+            nullcontext(reusable_workspace)
+            if reusable_workspace is not None
+            else ValidationWorkspace(project)
+        )
+        with workspace_context as workspace:
+            if reusable_workspace is not None:
+                workspace.reset_to_snapshot()
             snapshot_project = Project(
                 path=workspace.path,
                 project_id=project.project_id,

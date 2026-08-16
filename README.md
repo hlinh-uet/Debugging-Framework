@@ -1,8 +1,8 @@
 # Debugging Framework
 
 Framework tự động **Fault Localization (FL)** và **Automated Program Repair
-(APR)** cho project C/C++. Codex phân tích một snapshot tạm, tạo patch, sau đó
-framework build và chạy test lại trên một snapshot sạch trước khi trả kết quả.
+(APR)** cho project C/C++. Codex sửa một snapshot tạm; framework lấy Git diff
+trực tiếp từ filesystem, reset snapshot rồi apply và chạy test trước khi trả kết quả.
 
 CodeGraph 1.5.0 đã được đóng gói sẵn để hỗ trợ Codex điều hướng source code.
 Người dùng không cần cài Node.js, npm, npx hoặc CodeGraph riêng.
@@ -143,9 +143,9 @@ debugging-framework repair \
 Framework sẽ:
 
 1. Nhận failure log và failing test IDs do caller cung cấp, không chạy source gốc.
-2. Copy project sang snapshot tạm và chuẩn bị CodeGraph nếu khả dụng.
-3. Cho Codex thực hiện FL và APR từ failure log đã cung cấp.
-4. Áp patch lên một snapshot sạch khác rồi setup/build.
+2. Copy project đúng một lần sang snapshot tạm dùng chung cho các attempt và chuẩn bị CodeGraph nếu khả dụng.
+3. Trước mỗi attempt, reset snapshot; cho Codex thực hiện FL và APR từ failure log đã cung cấp.
+4. Lấy canonical Git diff từ thay đổi thật trong workspace, reset rồi apply diff đó để setup/build/test.
 5. Nếu có `target_test`, chạy nó trước; target fail sẽ chuyển feedback sang attempt sau.
 6. Chỉ khi target pass mới chạy `regression_test` full suite.
 7. Nếu không có `target_test`, chạy thẳng full suite cho mỗi attempt.
@@ -163,7 +163,11 @@ Các file thường cần xem:
 
 - `patch.diff`: patch được chọn.
 - `result.json`: trạng thái validation cuối cùng.
-- `attempts/attempt_NN/`: prompt, phản hồi Codex, raw patch và log.
+- `attempts/attempt_NN/`: prompt, phản hồi Codex, canonical workspace patch và log.
+
+Codex chỉ trả mô tả repair và danh sách path; Codex không phải tự chép diff vào
+JSON. Framework bổ sung canonical workspace diff vào `repair.diff` trong
+`result.json`, và dùng cùng nội dung cho validation lẫn `patch.diff`.
 
 Failure baseline chỉ đến từ caller nên không sinh artifact hoặc chạy command.
 Mỗi thư mục kết quả repair chỉ giữ `attempts/`, `patch.diff` (khi Codex tạo được

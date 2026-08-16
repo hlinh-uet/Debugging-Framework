@@ -205,7 +205,7 @@ def non_repairable_patch_paths(values: list[str] | tuple[str, ...]) -> list[str]
 
 
 class ProjectWorkspace:
-    """A disposable, history-free snapshot that the repair agent may modify."""
+    """A reusable, disposable snapshot for repair attempts and validation."""
 
     def __init__(self, project, workspace_parent: Path):
         self.project = project
@@ -220,6 +220,7 @@ class ProjectWorkspace:
                 Path(tempfile.gettempdir()).resolve() / "debugging-framework-llm"
             )
         self.path = self.parent / f"{safe_name(project.project_id, 70)}-{uuid.uuid4().hex[:10]}"
+        self.snapshot_commit = ""
 
     def __enter__(self) -> "ProjectWorkspace":
         if not self.owner.is_dir():
@@ -282,6 +283,9 @@ class ProjectWorkspace:
         for offset in range(0, len(files), 500):
             self._run_git("add", "-f", "--", *files[offset : offset + 500], timeout=120)
         self._run_git("commit", "--no-gpg-sign", "-m", "Project snapshot", timeout=180)
+        self.snapshot_commit = self._git_text("rev-parse", "HEAD", timeout=30).strip()
+        if not self.snapshot_commit:
+            raise WorkspaceError("Không xác định được commit của project snapshot")
 
     def _llm_ignored_paths(self, directory: str, names: list[str]) -> set[str]:
         current = Path(directory).resolve()
@@ -310,8 +314,53 @@ class ProjectWorkspace:
             )
         return ignored
 
+    def reset_to_snapshot(self) -> None:
+        """Restore the owned workspace without touching the input project.
+
+        CodeGraph's repository index is retained because it is read-only navigation
+        metadata and can be reused across attempts. All tracked edits, intent-to-add
+        entries, build output, and other untracked files are removed.
+        """
+        if not self.snapshot_commit:
+            raise WorkspaceError("Project snapshot chưa được khởi tạo")
+        self._run_git("reset", "--hard", self.snapshot_commit, timeout=120)
+        self._run_git(
+            "clean", "-ffdx", "-e", ".codegraph/", "-e", "codegraph.json",
+            timeout=180,
+        )
+
+    def canonical_diff(self) -> str:
+        """Return the exact Git diff represented by the workspace filesystem.
+
+        ``git diff`` normally omits untracked files. Marking them intent-to-add makes
+        newly created source files visible without staging their contents or changing
+        the snapshot commit.
+        """
+        untracked = self._git_paths("ls-files", "--others", "--exclude-standard")
+        for offset in range(0, len(untracked), 500):
+            self._run_git(
+                "add", "--intent-to-add", "--", *untracked[offset : offset + 500],
+                timeout=120,
+            )
+        completed = subprocess.run(
+            [
+                "git", "-C", str(self.path), "diff", "--no-ext-diff", "--binary",
+                "--full-index", "--no-renames", self.snapshot_commit, "--",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace", timeout=120, check=False,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip().splitlines()
+            raise WorkspaceError(
+                "workspace_diff_failed:"
+                + (detail[-1] if detail else "unknown")
+            )
+        return completed.stdout
+
     def changed_repository_files(self) -> list[str]:
-        return sorted(set(self._git_paths("diff", "--name-only")))
+        diff = self.canonical_diff()
+        return sorted(set(self.unified_diff_paths(diff))) if diff.strip() else []
 
     def unified_diff_paths(self, diff: str) -> list[str]:
         return self._unified_diff_paths(str(diff or ""))
@@ -323,7 +372,7 @@ class ProjectWorkspace:
             if not relpath:
                 raise WorkspaceError(f"Patch path không an toàn: {value}")
             completed = subprocess.run(
-                ["git", "-C", str(self.path), "show", f"HEAD:{relpath}"],
+                ["git", "-C", str(self.path), "show", f"{self.snapshot_commit}:{relpath}"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60, check=False,
             )
             hashes[relpath] = (
@@ -331,6 +380,9 @@ class ProjectWorkspace:
                 if completed.returncode == 0 else None
             )
         return hashes
+
+    def apply_unified_diff(self, diff: str, expected_paths: list[str] | None = None) -> list[str]:
+        return _apply_unified_diff(self.path, diff, expected_paths)
 
     def _unified_diff_paths(self, text: str) -> list[str]:
         completed = subprocess.run(
@@ -367,6 +419,9 @@ class ProjectWorkspace:
         return [item.decode("utf-8", errors="replace") for item in completed.stdout.split(b"\0") if item]
 
     def _run_git(self, *arguments: str, timeout: int) -> None:
+        self._git_text(*arguments, timeout=timeout)
+
+    def _git_text(self, *arguments: str, timeout: int) -> str:
         completed = subprocess.run(
             ["git", "-C", str(self.path), *arguments],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -377,6 +432,7 @@ class ProjectWorkspace:
             raise WorkspaceError(
                 f"git {' '.join(arguments[:3])} lỗi: {detail[-1] if detail else 'unknown'}"
             )
+        return completed.stdout
 
 
 class ValidationWorkspace:
@@ -416,61 +472,7 @@ class ValidationWorkspace:
         shutil.rmtree(resolved)
 
     def apply_unified_diff(self, diff: str, expected_paths: list[str] | None = None) -> list[str]:
-        text = str(diff or "")
-        if not text.strip():
-            raise WorkspaceError("validation_diff_empty")
-        parsed = subprocess.run(
-            ["git", "-C", str(self.path), "apply", "--numstat", "-z", "-"],
-            input=text.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=120, check=False,
-        )
-        if parsed.returncode != 0:
-            detail = parsed.stderr.decode("utf-8", errors="replace").strip().splitlines()
-            raise WorkspaceError(
-                "validation_diff_parse_failed:" + (detail[-1] if detail else "unknown")
-            )
-        paths = []
-        for record in parsed.stdout.split(b"\0"):
-            if not record:
-                continue
-            fields = record.split(b"\t", 2)
-            relpath = normalize_relpath(
-                fields[2].decode("utf-8", errors="replace") if len(fields) == 3 else ""
-            )
-            if not relpath or PurePosixPath(relpath).parts[0] == ".git":
-                raise WorkspaceError("validation_diff_contains_unsafe_path")
-            candidate = self.path / relpath
-            if candidate.is_symlink():
-                raise WorkspaceError(f"validation_diff_targets_symlink:{relpath}")
-            try:
-                candidate.resolve(strict=False).relative_to(self.path)
-            except ValueError as exc:
-                raise WorkspaceError(f"validation_diff_path_escape:{relpath}") from exc
-            paths.append(relpath)
-        if not paths:
-            raise WorkspaceError("validation_diff_changed_path_count:0")
-        if expected_paths is not None and paths != expected_paths:
-            raise WorkspaceError(
-                "validation_diff_path_mismatch:"
-                + ",".join(expected_paths)
-                + ":"
-                + ",".join(paths)
-            )
-        for check in (True, False):
-            command = ["git", "-C", str(self.path), "apply", "--whitespace=nowarn"]
-            if check:
-                command.append("--check")
-            completed = subprocess.run(
-                [*command, "-"], input=text, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace", timeout=120, check=False,
-            )
-            if completed.returncode != 0:
-                detail = (completed.stderr or completed.stdout).strip().splitlines()
-                raise WorkspaceError(
-                    "validation_diff_apply_failed:"
-                    + (detail[-1] if detail else "unknown")
-                )
-        return paths
+        return _apply_unified_diff(self.path, diff, expected_paths)
 
     def _ignored_paths(self, directory: str, names: list[str]) -> set[str]:
         current = Path(directory).resolve()
@@ -501,3 +503,65 @@ class ValidationWorkspace:
                 if Path(name).suffix.lower() in {".log", ".xml", ".status", ".msg"}
             )
         return ignored
+
+
+def _apply_unified_diff(
+    workspace_path: Path,
+    diff: str,
+    expected_paths: list[str] | None = None,
+) -> list[str]:
+    text = str(diff or "")
+    if not text.strip():
+        raise WorkspaceError("validation_diff_empty")
+    parsed = subprocess.run(
+        ["git", "-C", str(workspace_path), "apply", "--numstat", "-z", "-"],
+        input=text.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=120, check=False,
+    )
+    if parsed.returncode != 0:
+        detail = parsed.stderr.decode("utf-8", errors="replace").strip().splitlines()
+        raise WorkspaceError(
+            "validation_diff_parse_failed:" + (detail[-1] if detail else "unknown")
+        )
+    paths = []
+    for record in parsed.stdout.split(b"\0"):
+        if not record:
+            continue
+        fields = record.split(b"\t", 2)
+        relpath = normalize_relpath(
+            fields[2].decode("utf-8", errors="replace") if len(fields) == 3 else ""
+        )
+        if not relpath or PurePosixPath(relpath).parts[0] == ".git":
+            raise WorkspaceError("validation_diff_contains_unsafe_path")
+        candidate = workspace_path / relpath
+        if candidate.is_symlink():
+            raise WorkspaceError(f"validation_diff_targets_symlink:{relpath}")
+        try:
+            candidate.resolve(strict=False).relative_to(workspace_path)
+        except ValueError as exc:
+            raise WorkspaceError(f"validation_diff_path_escape:{relpath}") from exc
+        paths.append(relpath)
+    if not paths:
+        raise WorkspaceError("validation_diff_changed_path_count:0")
+    if expected_paths is not None and paths != expected_paths:
+        raise WorkspaceError(
+            "validation_diff_path_mismatch:"
+            + ",".join(expected_paths)
+            + ":"
+            + ",".join(paths)
+        )
+    for check in (True, False):
+        command = ["git", "-C", str(workspace_path), "apply", "--whitespace=nowarn"]
+        if check:
+            command.append("--check")
+        completed = subprocess.run(
+            [*command, "-"], input=text, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", timeout=120, check=False,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip().splitlines()
+            raise WorkspaceError(
+                "validation_diff_apply_failed:"
+                + (detail[-1] if detail else "unknown")
+            )
+    return paths

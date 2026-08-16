@@ -135,6 +135,10 @@ class OCIEnvironment:
                 'cd "$1" || exit $?; shift; '
                 '"$@"; command_status=$?; '
                 'cd /tmp || exit $?; '
+                # Git metadata belongs to the host-side disposable workspace.
+                # Copying native-container object files back can fail because Git
+                # stores them read-only, and validation never needs Git mutations.
+                'rm -rf "$workspace"/.git || exit $?; '
                 'cp -a "$workspace"/. /input/; copy_status=$?; '
                 '[ "$copy_status" -eq 0 ] || exit "$copy_status"; '
                 'exit "$command_status"'

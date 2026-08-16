@@ -119,8 +119,8 @@ def build_codex_prompt(
     )
 
     workspace_description = (
-        "This is a disposable, writable snapshot of the input project. The framework has "
-        "copied the entire project, including source, tests, manifests, lockfiles and documentation."
+        "This is a reusable, disposable, writable snapshot of the input project. The "
+        "framework resets it to the original snapshot before each repair attempt."
     )
     repository_context = str(repository_context or "").strip()
     repository_navigation = (
@@ -130,7 +130,8 @@ def build_codex_prompt(
     )
     return f"""You are a software engineer performing fault localization and program repair.
 {workspace_description} {workflow_context}
-The framework will extract your patch and independently validate it on fresh copies.
+The framework will extract the exact Git diff from your workspace changes, reset the
+snapshot, and independently validate that diff. The input project is never modified.
 
 {investigation_context}
 {known_failure}
@@ -150,9 +151,8 @@ Constraints:
   credentials in the repair.
 - Make the smallest root-cause fix that preserves public APIs and project style.
 - `repair.paths` must list every intentionally changed repository-relative file.
-- `repair.diff` must be a raw unified/Git diff beginning with `diff --git a/...`
-  or `--- a/<path>`, contain all intentional changes, and have no Markdown fence.
-- Do not wrap the diff in prose, Markdown fences, or `*** Begin Patch`/`*** End Patch` markers.
+- Do not return or manually transcribe a diff. The framework obtains the canonical
+  diff directly from the final workspace filesystem after you finish editing.
 - Return only valid JSON matching the supplied schema. Do not claim that tests passed.
 
 Fault-localization entries must contain path, function/symbol, score in [0,1], and
@@ -165,6 +165,7 @@ Run context:
 
 {baseline_context}
 
-Inspect the project, implement and test the repair in this workspace, review
-the final diff, then return JSON with exactly `summary`, `fault_localization`, and `repair`.
+Inspect the project, implement and test the repair in this workspace, review the
+actual workspace changes, then return JSON with exactly `summary`,
+`fault_localization`, and `repair`.
 """

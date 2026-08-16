@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import shutil
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -13,7 +14,6 @@ from src.utils.jsonio import atomic_write_json, atomic_write_text, safe_name
 from src.utils.workspace import (
     ProjectWorkspace,
     normalize_relpath,
-    normalize_unified_diff,
 )
 
 
@@ -119,14 +119,15 @@ class DebuggingPipeline:
         attempts: list[dict] = []
         candidates: list[dict] = []
         payloads: list[dict] = []
-        raw_patches: list[dict] = []
+        workspace_patches: list[dict] = []
         previous_feedback: dict | None = None
-        for attempt_index in range(1, options.attempts + 1):
-            print(f"[attempt {attempt_index}/{options.attempts}] Codex đọc project và tạo patch")
-            attempt_dir = project_results / "attempts" / f"attempt_{attempt_index:02d}"
-            attempt_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                with ProjectWorkspace(project, project_results / "workspaces") as workspace:
+        with ProjectWorkspace(project, project_results / "workspaces") as workspace:
+            for attempt_index in range(1, options.attempts + 1):
+                print(f"[attempt {attempt_index}/{options.attempts}] Codex đọc project và tạo patch")
+                attempt_dir = project_results / "attempts" / f"attempt_{attempt_index:02d}"
+                attempt_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    workspace.reset_to_snapshot()
                     self._write_baseline_context(workspace, baseline_snapshot)
                     context_preparation = context_backend.prepare(
                         workspace.path,
@@ -166,42 +167,47 @@ class DebuggingPipeline:
                             (attempt_dir / "stderr.txt").relative_to(project_results)
                         ),
                     }
-                    raw_diff = str(((run.payload or {}).get("repair") or {}).get("diff") or "")
-                    if raw_diff.strip():
-                        raw_diff_path = attempt_dir / "llm.patch.diff"
-                        atomic_write_text(raw_diff_path, raw_diff)
-                        normalized_diff, normalization_actions = normalize_unified_diff(raw_diff)
-                        if normalization_actions:
-                            normalized_path = attempt_dir / "normalized.patch.diff"
-                            atomic_write_text(normalized_path, normalized_diff)
-                            base_attempt["normalized_patch_artifact"] = str(
-                                normalized_path.relative_to(project_results)
-                            )
-                            base_attempt["diff_normalization_actions"] = normalization_actions
-                        raw_diff = normalized_diff
-                        raw_record = {
-                            "attempt": attempt_index,
-                            "diff": raw_diff,
-                            "artifact": str(raw_diff_path.relative_to(project_results)),
-                        }
-                        raw_patches.append(raw_record)
-                        base_attempt["llm_patch_artifact"] = raw_record["artifact"]
                     if not run.ok:
                         attempts.append({**base_attempt, "status": "llm_failed"})
                         previous_feedback = {"error": run.error}
                         continue
-                    payloads.append(run.payload)
+
+                    canonical_diff = workspace.canonical_diff()
+                    if not canonical_diff.strip():
+                        error = "codex_workspace_diff_empty"
+                        attempts.append(
+                            {**base_attempt, **self.validator.invalid_snapshot(error)}
+                        )
+                        payloads.append(run.payload)
+                        previous_feedback = {"error": error}
+                        continue
+                    workspace_patch_path = attempt_dir / "workspace.patch.diff"
+                    atomic_write_text(workspace_patch_path, canonical_diff)
+                    canonical_repair = deepcopy((run.payload or {}).get("repair") or {})
+                    canonical_repair["diff"] = canonical_diff
+                    workspace_record = {
+                        "attempt": attempt_index,
+                        "diff": canonical_diff,
+                        "artifact": str(workspace_patch_path.relative_to(project_results)),
+                        "repair": canonical_repair,
+                    }
+                    workspace_patches.append(workspace_record)
+                    base_attempt["workspace_patch_artifact"] = workspace_record["artifact"]
 
                     try:
-                        patch_paths = workspace.unified_diff_paths(raw_diff)
+                        patch_paths = workspace.unified_diff_paths(canonical_diff)
                     except Exception as exc:
-                        error = f"codex_diff_parse_failed:{exc}"
+                        error = f"workspace_diff_parse_failed:{exc}"
                         attempts.append(
                             {**base_attempt, **self.validator.invalid_snapshot(error)}
                         )
                         previous_feedback = {"error": error}
                         continue
-                    policy_error = self._response_path_error(run.payload, patch_paths)
+                    canonical_payload = deepcopy(run.payload)
+                    canonical_payload.setdefault("repair", {})["diff"] = canonical_diff
+                    base_attempt["response"] = canonical_payload
+                    payloads.append(canonical_payload)
+                    policy_error = self._response_path_error(canonical_payload, patch_paths)
                     if policy_error:
                         attempts.append(
                             {**base_attempt, **self.validator.invalid_snapshot(policy_error)}
@@ -212,23 +218,24 @@ class DebuggingPipeline:
                         }
                         continue
                     snapshot_hashes = workspace.snapshot_sha256s(patch_paths)
-                    workspace_changes = workspace.changed_repository_files()
-                    localized = select_localizations(run.payload, patch_paths)
+                    workspace_changes = patch_paths
+                    localized = select_localizations(canonical_payload, patch_paths)
                     selected_functions = [
                         localization_key(item.get("path"), item.get("function"))
                         for item in localized
                     ]
                     diff_path = attempt_dir / "validated.patch.diff"
-                    atomic_write_text(diff_path, raw_diff)
+                    atomic_write_text(diff_path, canonical_diff)
 
                     print(
                         f"[attempt {attempt_index}/{options.attempts}] "
                         f"Apply/provision/build/test diff: {len(patch_paths)} file(s)"
                     )
                     try:
+                        workspace.reset_to_snapshot()
                         snapshot = self.validator.validate_diff(
                             project=project,
-                            diff=raw_diff,
+                            diff=canonical_diff,
                             patch_paths=patch_paths,
                             artifact_dir=attempt_dir / "validation",
                             expected_sha256s=snapshot_hashes,
@@ -240,6 +247,7 @@ class DebuggingPipeline:
                             expected_image_digest=baseline_snapshot.get(
                                 "provisioned_image_digest", ""
                             ),
+                            reusable_workspace=workspace,
                         )
                     except Exception as exc:
                         snapshot = self.validator.invalid_snapshot(
@@ -251,8 +259,7 @@ class DebuggingPipeline:
                         **snapshot,
                         "repair_paths": patch_paths,
                         "selected_functions": selected_functions,
-                        "patch_diff": raw_diff,
-                        "llm_patch_artifact": base_attempt.get("llm_patch_artifact", ""),
+                        "patch_diff": canonical_diff,
                         "patch_diff_artifact": str(diff_path.relative_to(project_results)),
                         "snapshot_sha256s": snapshot_hashes,
                         "workspace_changed_files": workspace_changes[:200],
@@ -269,7 +276,7 @@ class DebuggingPipeline:
                     attempts.append(public_attempt(candidate))
                     if snapshot.get("status") == "plausible":
                         try:
-                            atomic_write_text(output_patch, raw_diff)
+                            atomic_write_text(output_patch, canonical_diff)
                         except OSError as exc:
                             candidate["status"] = "invalid"
                             candidate["validation_error"] = (
@@ -278,21 +285,18 @@ class DebuggingPipeline:
                             attempts[-1] = public_attempt(candidate)
                             previous_feedback = {"error": candidate["validation_error"]}
                             continue
-                        result = self._result(
-                            project, attempts, candidate, output_patch, payloads
-                        )
-                        return self._finish(project_results, result)
+                        break
                     previous_feedback = {
                         "error": snapshot.get("validation_error") or "tests_still_fail",
                         "outcome": snapshot.get("status"),
                         "failed_tests": snapshot.get("failed_test_ids", []),
                         "test_output": snapshot.get("failure_output", ""),
-                        "previous_patch": raw_diff,
+                        "previous_patch": canonical_diff,
                     }
-            except Exception as exc:
-                error = f"attempt_exception:{type(exc).__name__}:{exc}"
-                attempts.append({"attempt": attempt_index, "status": "invalid", "error": error})
-                previous_feedback = {"error": error}
+                except Exception as exc:
+                    error = f"attempt_exception:{type(exc).__name__}:{exc}"
+                    attempts.append({"attempt": attempt_index, "status": "invalid", "error": error})
+                    previous_feedback = {"error": error}
 
         if candidates:
             best = min(candidates, key=candidate_sort_key)
@@ -308,15 +312,16 @@ class DebuggingPipeline:
             result = self._result(
                 project, attempts, best, output_patch if published else None, payloads
             )
-        elif raw_patches:
-            latest = raw_patches[-1]
+        elif workspace_patches:
+            latest = workspace_patches[-1]
             published, publish_error = self._publish_selected_patch(output_patch, latest["diff"])
             result = {
                 "status": "invalid",
                 "validation_error": publish_error or "codex_did_not_produce_applicable_patch",
                 "project": str(project.path),
                 "output_patch": str(output_patch) if published else "",
-                "llm_patch_artifact": latest["artifact"],
+                "workspace_patch_artifact": latest["artifact"],
+                "repair": latest["repair"],
                 "patch_validation_passed": False,
                 "baseline": baseline_snapshot,
                 "attempts": attempts,
@@ -340,7 +345,9 @@ class DebuggingPipeline:
                 "validation_error": terminal_error,
                 "project": str(project.path),
                 "output_patch": "",
-                "llm_patch_artifact": terminal_attempt.get("llm_patch_artifact", ""),
+                "workspace_patch_artifact": terminal_attempt.get(
+                    "workspace_patch_artifact", ""
+                ),
                 "codex_response_artifact": terminal_attempt.get(
                     "codex_response_artifact", ""
                 ),
@@ -383,9 +390,7 @@ class DebuggingPipeline:
             "repair_paths": candidate.get("repair_paths", []),
             "selected_functions": candidate.get("selected_functions", []),
             "patch_diff_artifact": candidate.get("patch_diff_artifact", ""),
-            "llm_patch_artifact": candidate.get("llm_patch_artifact", ""),
-            "normalized_patch_artifact": candidate.get("normalized_patch_artifact", ""),
-            "diff_normalization_actions": candidate.get("diff_normalization_actions", []),
+            "workspace_patch_artifact": candidate.get("workspace_patch_artifact", ""),
             "codex_response_artifact": candidate.get("codex_response_artifact", ""),
             "codex_events_artifact": candidate.get("codex_events_artifact", ""),
             "codex_stderr_artifact": candidate.get("codex_stderr_artifact", ""),
@@ -417,6 +422,7 @@ class DebuggingPipeline:
             },
             "attempts": attempts,
             "codex_response": candidate.get("response", {}),
+            "repair": (candidate.get("response") or {}).get("repair", {}),
             "fault_localization": self._fault_localization(payloads),
         }
 

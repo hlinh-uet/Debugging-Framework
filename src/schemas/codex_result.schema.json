@@ -28,13 +28,9 @@
           "minItems": 1,
           "items": { "type": "string" }
         },
-        "description": { "type": "string" },
-        "diff": {
-          "type": "string",
-          "pattern": "^(diff --git a/|--- a/)"
-        }
+        "description": { "type": "string" }
       },
-      "required": ["paths", "description", "diff"],
+      "required": ["paths", "description"],
       "additionalProperties": false
     }
   },
