@@ -23,7 +23,7 @@ class CodeGraphBackend:
         *,
         mode: str = "auto",
         executable: str = "",
-        timeout_seconds: int = 180,
+        timeout_seconds: int = 3600,
     ):
         mode = str(mode or "auto").strip().lower()
         if mode not in {"off", "auto", "required"}:
@@ -39,7 +39,7 @@ class CodeGraphBackend:
         return cls(
             mode=getattr(settings, "context_mode", "auto"),
             executable=getattr(settings, "codegraph_executable", ""),
-            timeout_seconds=getattr(settings, "codegraph_timeout_seconds", 180),
+            timeout_seconds=getattr(settings, "codegraph_timeout_seconds", 3600),
         )
 
     def probe(self) -> CodeGraphPreparation:
@@ -120,8 +120,12 @@ class CodeGraphBackend:
 
         init_log = artifact_dir / "codegraph-init.log"
         status_log = artifact_dir / "codegraph-status.txt"
+        # `init` exits successfully without repairing an existing partial
+        # index. Re-index snapshots that already contain repository metadata;
+        # this also recovers workspaces left behind by an interrupted attempt.
+        operation = "index" if (workspace / ".codegraph").is_dir() else "init"
         completed, error = self._run(
-            [str(probe.executable), "init", str(workspace)],
+            [str(probe.executable), operation, str(workspace)],
             cwd=workspace,
             timeout=self.timeout_seconds,
         )
@@ -149,17 +153,30 @@ class CodeGraphBackend:
         )
         status_output = _command_log(status_completed, status_error)
         atomic_write_text(status_log, _bounded(status_output))
+        status_health_error = ""
+        if (
+            not status_error
+            and status_completed is not None
+            and status_completed.returncode == 0
+        ):
+            status_health_error = _codegraph_status_error(status_output)
         if (
             status_error
             or status_completed is None
             or status_completed.returncode != 0
             or not (workspace / ".codegraph").is_dir()
+            or status_health_error
         ):
-            detail = status_error or (
-                f"codegraph_status_exit_{status_completed.returncode}"
-                if status_completed is not None
-                else "codegraph_status_failed"
-            )
+            if status_error:
+                detail = status_error
+            elif status_completed is None:
+                detail = "codegraph_status_failed"
+            elif status_completed.returncode != 0:
+                detail = f"codegraph_status_exit_{status_completed.returncode}"
+            elif not (workspace / ".codegraph").is_dir():
+                detail = "codegraph_index_missing"
+            else:
+                detail = status_health_error
             report = CodeGraphPreparation(
                 mode=self.mode,
                 status="degraded",
@@ -231,6 +248,13 @@ class CodeGraphBackend:
             "DO_NOT_TRACK": "1",
             "CODEGRAPH_NO_DOWNLOAD": "1",
             "CODEGRAPH_NO_DAEMON": "1",
+            # CodeGraph 1.5's optional native C/C++ extractor segfaults on
+            # valid parser stress inputs with extreme nesting (for example
+            # LLVM's parser_overflow.c). The process-level SIGSEGV cannot be
+            # recovered by CodeGraph's JavaScript fallback. Force its
+            # canonical WASM extractor so one pathological source file cannot
+            # truncate the index for an otherwise healthy large workspace.
+            "CODEGRAPH_KERNEL": "0",
         })
         try:
             completed = subprocess.run(
@@ -271,6 +295,30 @@ class CodeGraphBackend:
 def _parse_version(value: str) -> str:
     match = re.search(r"(?<!\d)(\d+\.\d+\.\d+)(?!\d)", value)
     return match.group(1) if match else ""
+
+
+_ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])")
+
+
+def _codegraph_status_error(value: str) -> str:
+    """Return an error when CodeGraph reports a partial or stale index.
+
+    CodeGraph 1.5 exits with status 0 even after a previous indexing process
+    crashed, so the exit code and presence of ``.codegraph`` are insufficient.
+    Its successful status output contains the explicit "Index is up to date"
+    marker; require that marker and reject known interrupted-run diagnostics.
+    """
+    normalized = _ANSI_ESCAPE.sub("", str(value or "")).casefold()
+    incomplete_markers = (
+        "last index run never finished",
+        "index is truncated",
+    )
+    for marker in incomplete_markers:
+        if marker in normalized:
+            return f"codegraph_index_incomplete:{marker.replace(' ', '_')}"
+    if not re.search(r"\bindex is up[\s-]+to[\s-]+date\b", normalized):
+        return "codegraph_status_not_ready"
+    return ""
 
 
 def _subprocess_text(value: str | bytes | None) -> str:

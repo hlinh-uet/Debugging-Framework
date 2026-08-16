@@ -133,7 +133,7 @@ class FrameworkConfig:
     environment_image: str = ""
     context_mode: str = "auto"
     codegraph_executable: str = ""
-    codegraph_timeout_seconds: int = 180
+    codegraph_timeout_seconds: int = 3600
 
     @classmethod
     def load(
@@ -177,7 +177,7 @@ class FrameworkConfig:
             codegraph_executable=get("DEBUGGING_CODEGRAPH_BIN", ""),
             codegraph_timeout_seconds=_int(
                 "DEBUGGING_CODEGRAPH_TIMEOUT",
-                get("DEBUGGING_CODEGRAPH_TIMEOUT", "180"),
+                get("DEBUGGING_CODEGRAPH_TIMEOUT", "3600"),
                 1,
             ),
         )
@@ -197,7 +197,7 @@ class Settings:
     environment_image: str = ""
     context_mode: str = "auto"
     codegraph_executable: str = ""
-    codegraph_timeout_seconds: int = 180
+    codegraph_timeout_seconds: int = 3600
 
     @property
     def output_schema(self) -> Path:

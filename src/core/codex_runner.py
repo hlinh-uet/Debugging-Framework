@@ -136,6 +136,7 @@ class CodexRunner:
                 "CODEGRAPH_NO_DOWNLOAD": "1",
                 "CODEGRAPH_NO_WATCH": "1",
                 "CODEGRAPH_NO_DAEMON": "1",
+                "CODEGRAPH_KERNEL": "0",
             })
         if self.api_key:
             # The key is scoped to `codex exec`; never place it in the command

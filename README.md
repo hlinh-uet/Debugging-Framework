@@ -228,7 +228,7 @@ Các biến môi trường hữu ích:
 | `DEBUGGING_CODEX_MODEL` | `gpt-5.6-sol` | Model dùng cho repair |
 | `DEBUGGING_RESULTS_DIR` | thư mục state của user | Nơi lưu kết quả |
 | `DEBUGGING_CONTEXT_MODE` | `auto` | Chế độ CodeGraph: `auto`, `required`, `off` |
-| `DEBUGGING_CODEGRAPH_TIMEOUT` | `180` | Timeout chuẩn bị graph, tính bằng giây |
+| `DEBUGGING_CODEGRAPH_TIMEOUT` | `3600` | Timeout chuẩn bị graph, tính bằng giây |
 
 Không cần cấu hình CodeGraph executable khi dùng bản wheel/repository đã đóng
 gói. Với workflow thông thường, không cần đặt bất kỳ biến CodeGraph nào; các
