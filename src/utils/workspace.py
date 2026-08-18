@@ -274,7 +274,11 @@ class ProjectWorkspace:
         self.reserve()
         self._entered = True
         try:
-            if self._git_root() is None:
+            # ``git rev-parse`` walks through parent directories. A disposable
+            # benchmark input may therefore appear to belong to the outer
+            # defects4c checkout even though it has no repository of its own.
+            # Only an exact root match represents this project's repository.
+            if self._git_root() != self.owner:
                 if not (
                     self.workspace_config.disposable
                     and self.workspace_config.initialize_git_if_missing
@@ -327,7 +331,7 @@ class ProjectWorkspace:
         if not self.owner.is_dir():
             raise WorkspaceError(f"Project không tồn tại: {self.owner}")
         root = self._git_root()
-        if root is None:
+        if root != self.owner:
             if not (
                 self.workspace_config.disposable
                 and self.workspace_config.initialize_git_if_missing
@@ -341,10 +345,6 @@ class ProjectWorkspace:
                 "git": "initialize-temporary",
                 "disposable": True,
             }
-        if root != self.owner:
-            raise WorkspaceError(
-                f"Project phải là Git worktree root, không phải thư mục con: {self.owner}"
-            )
         status = self._git_text(
             "status", "--porcelain=v1", "--untracked-files=all", timeout=60
         )
