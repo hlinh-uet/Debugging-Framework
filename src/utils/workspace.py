@@ -717,9 +717,15 @@ class ProjectWorkspace:
             if not relpath:
                 raise WorkspaceError(f"Patch path không an toàn: {value}")
             completed = subprocess.run(
-                ["git", "-C", str(self.path), "show", f"{self.snapshot_commit}:{relpath}"],
+                [
+                    "git", "-C", str(self.path), "cat-file", "--filters",
+                    f"{self.snapshot_commit}:{relpath}",
+                ],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60, check=False,
             )
+            # Hash the checkout representation, not the raw blob. Attributes
+            # such as PHP's ``ident`` filter legitimately transform bytes when
+            # reset/checkout writes the baseline back to the filesystem.
             hashes[relpath] = (
                 hashlib.sha256(completed.stdout).hexdigest()
                 if completed.returncode == 0 else None
