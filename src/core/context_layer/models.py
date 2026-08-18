@@ -30,7 +30,7 @@ class CodeGraphPreparation:
             return ""
         return (
             "A read-only CodeGraph navigation index has been prepared for this "
-            "disposable snapshot. Start structural repository investigation with "
+            "recoverable project baseline. Start structural repository investigation with "
             "`codegraph explore \"<question about the failure, symbols, or call flow>\"`; "
             "use `codegraph node`, `codegraph callers`, or `codegraph callees` for "
             "narrow follow-up queries. CodeGraph is navigational evidence, not fault "

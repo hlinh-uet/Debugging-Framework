@@ -32,6 +32,7 @@ class RepairProjectConfig:
     jobs: int | None = None
     inherit_codex_config: bool | None = None
     output: str = ""
+    source_extensions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -42,11 +43,20 @@ class EnvironmentProjectConfig:
 
 
 @dataclass(frozen=True)
+class WorkspaceProjectConfig:
+    """Authorization for operating directly on the supplied project tree."""
+
+    disposable: bool = False
+    initialize_git_if_missing: bool = False
+
+
+@dataclass(frozen=True)
 class ProjectConfig:
     path: Path
     raw: dict[str, Any]
     repair: RepairProjectConfig = RepairProjectConfig()
     environment: EnvironmentProjectConfig = EnvironmentProjectConfig()
+    workspace: WorkspaceProjectConfig = WorkspaceProjectConfig()
 
     @property
     def exists(self) -> bool:
@@ -87,6 +97,7 @@ def load_project_config_file(path: Path) -> ProjectConfig:
         raw=raw,
         repair=_parse_repair(raw.get("repair"), path),
         environment=_parse_environment(raw.get("environment"), path),
+        workspace=_parse_workspace(raw.get("workspace"), path),
     )
 
 
@@ -124,6 +135,7 @@ def _parse_repair(value: object, path: Path) -> RepairProjectConfig:
         {
             "failing_tests", "attempts", "model",
             "codex_timeout", "command_timeout", "jobs", "inherit_codex_config", "output",
+            "source_extensions",
         },
     )
     return RepairProjectConfig(
@@ -141,7 +153,38 @@ def _parse_repair(value: object, path: Path) -> RepairProjectConfig:
             value.get("inherit_codex_config"), path, "repair.inherit_codex_config"
         ),
         output=_optional_string(value.get("output"), path, "repair.output"),
+        source_extensions=_source_extensions(
+            value.get("source_extensions", []), path, "repair.source_extensions"
+        ),
     )
+
+
+def _parse_workspace(value: object, path: Path) -> WorkspaceProjectConfig:
+    if value is None:
+        return WorkspaceProjectConfig()
+    if not isinstance(value, dict):
+        raise ValueError(f"{path}: workspace phải là JSON object")
+    _reject_unknown_fields(
+        value,
+        path,
+        "workspace",
+        {"disposable", "initialize_git_if_missing"},
+    )
+    workspace = WorkspaceProjectConfig(
+        disposable=bool(_optional_bool(value.get("disposable"), path, "workspace.disposable")),
+        initialize_git_if_missing=bool(
+            _optional_bool(
+                value.get("initialize_git_if_missing"),
+                path,
+                "workspace.initialize_git_if_missing",
+            )
+        ),
+    )
+    if workspace.initialize_git_if_missing and not workspace.disposable:
+        raise ValueError(
+            f"{path}: workspace.initialize_git_if_missing cần workspace.disposable=true"
+        )
+    return workspace
 
 
 def _parse_environment(value: object, path: Path) -> EnvironmentProjectConfig:
@@ -177,6 +220,20 @@ def _string_list(value: object, path: Path, name: str) -> tuple[str, ...]:
         text = item.strip()
         if text not in output:
             output.append(text)
+    return tuple(output)
+
+
+def _source_extensions(value: object, path: Path, name: str) -> tuple[str, ...]:
+    values = _string_list(value, path, name)
+    output: list[str] = []
+    for item in values:
+        extension = item.lower()
+        if not extension.startswith(".") or len(extension) < 2:
+            raise ValueError(f"{path}: {name} phải chứa extension dạng .ext")
+        if any(character not in ".abcdefghijklmnopqrstuvwxyz0123456789_+-" for character in extension):
+            raise ValueError(f"{path}: {name} chứa extension không hợp lệ: {item}")
+        if extension not in output:
+            output.append(extension)
     return tuple(output)
 
 

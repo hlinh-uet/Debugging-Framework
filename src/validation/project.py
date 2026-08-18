@@ -24,9 +24,9 @@ from src.utils.project_config import (
 )
 from src.utils.workspace import (
     ProjectWorkspace,
-    ValidationWorkspace,
     non_repairable_patch_paths,
     normalize_relpath,
+    source_extensions_for_project,
 )
 
 
@@ -391,7 +391,7 @@ class BuildDetector:
         )
 
 class ProjectValidator:
-    """Run isolated validation on a project or an applied diff."""
+    """Validate a project or applied diff from a recoverable Git baseline."""
 
     def __init__(
         self,
@@ -447,10 +447,17 @@ class ProjectValidator:
         failing_tests: tuple[str, ...] = (),
         expected_plan_digest: str = "",
         expected_environment_digest: str = "",
+        reusable_workspace: ProjectWorkspace | None = None,
     ) -> dict:
-        """Reproduce the supplied failing test on a clean project snapshot."""
+        """Reproduce the supplied failing test from the in-place Git baseline."""
         self._require_artifacts_outside_input(project, artifact_dir)
-        with ValidationWorkspace(project) as workspace:
+        workspace_context = (
+            nullcontext(reusable_workspace)
+            if reusable_workspace is not None
+            else ProjectWorkspace(project, artifact_dir / "workspace")
+        )
+        with workspace_context as workspace:
+            workspace.reset_to_snapshot()
             snapshot_project = Project(
                 path=workspace.path,
                 project_id=project.project_id,
@@ -489,8 +496,9 @@ class ProjectValidator:
         snapshot["environment"] = environment.as_dict()
         snapshot["environment_digest"] = environment.digest
         snapshot["plan_digest"] = plan_digest
-        snapshot["validation_workspace_isolated"] = True
-        snapshot["input_project_untouched"] = True
+        snapshot["validation_workspace_isolated"] = False
+        snapshot["input_project_untouched"] = False
+        snapshot["input_project_restored"] = reusable_workspace is None
         return snapshot
 
     def external_baseline(
@@ -587,7 +595,10 @@ class ProjectValidator:
             return self.invalid_snapshot("patch_contains_unsafe_path")
         if len(set(normalized_paths)) != len(normalized_paths):
             return self.invalid_snapshot("patch_contains_duplicate_path")
-        blocked_paths = non_repairable_patch_paths(normalized_paths)
+        blocked_paths = non_repairable_patch_paths(
+            normalized_paths,
+            source_extensions_for_project(project),
+        )
         if blocked_paths:
             snapshot = self.invalid_snapshot(
                 "test_oracle_modified_or_non_production_patch:"
@@ -614,11 +625,10 @@ class ProjectValidator:
         workspace_context = (
             nullcontext(reusable_workspace)
             if reusable_workspace is not None
-            else ValidationWorkspace(project)
+            else ProjectWorkspace(project, artifact_dir / "workspace")
         )
         with workspace_context as workspace:
-            if reusable_workspace is not None:
-                workspace.reset_to_snapshot()
+            workspace.reset_to_snapshot()
             snapshot_project = Project(
                 path=workspace.path,
                 project_id=project.project_id,
@@ -669,8 +679,9 @@ class ProjectValidator:
         snapshot["environment"] = environment.as_dict()
         snapshot["environment_digest"] = environment.digest
         snapshot["plan_digest"] = plan_digest
-        snapshot["validation_workspace_isolated"] = True
-        snapshot["input_project_untouched"] = True
+        snapshot["validation_workspace_isolated"] = False
+        snapshot["input_project_untouched"] = False
+        snapshot["input_project_restored"] = reusable_workspace is None
         return snapshot
 
     def invalid_snapshot(self, error: str) -> dict:
@@ -688,9 +699,10 @@ class ProjectValidator:
             "target_passed": False,
             "environment_provisioned": False,
             "setup_executed": False,
-            "validation_workspace_isolated": True,
+            "validation_workspace_isolated": False,
             "validation_process_sandboxed": self._validation_process_sandboxed(),
-            "input_project_untouched": True,
+            "input_project_untouched": False,
+            "input_project_restored": False,
         }
 
     def _validation_process_sandboxed(self) -> bool:

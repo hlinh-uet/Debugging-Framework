@@ -210,7 +210,7 @@ class CodeGraphBackend:
         """Cover C/C++ extensions accepted by the repair-path policy.
 
         A caller-owned CodeGraph configuration remains authoritative. The
-        generated file is repository metadata for the disposable snapshot only
+        generated file is repository metadata for the recoverable project baseline only
         and is ignored by its internal Git repository.
         """
         destination = workspace / "codegraph.json"

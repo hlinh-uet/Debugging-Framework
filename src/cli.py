@@ -749,9 +749,6 @@ def validate_patch(
     )
     artifact_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_text(artifact_dir / "input.patch.diff", diff)
-    with ProjectWorkspace(project, artifact_dir / "workspaces") as workspace:
-        patch_paths = workspace.unified_diff_paths(diff)
-        snapshot_hashes = workspace.snapshot_sha256s(patch_paths)
     validator = ProjectValidator(
         command_timeout=timeout,
         jobs=jobs,
@@ -760,32 +757,42 @@ def validate_patch(
         environment_image=getattr(settings, "environment_image", ""),
     )
     baseline = None
-    if failing_tests:
-        baseline = validator.baseline(
-            project,
-            artifact_dir / "baseline",
+    with ProjectWorkspace(project, artifact_dir / "workspace") as workspace:
+        patch_paths = workspace.unified_diff_paths(diff)
+        snapshot_hashes = workspace.snapshot_sha256s(patch_paths)
+        if failing_tests:
+            baseline = validator.baseline(
+                project,
+                artifact_dir / "baseline",
+                failing_tests=failing_tests,
+                reusable_workspace=workspace,
+            )
+            atomic_write_json(artifact_dir / "baseline.json", baseline)
+            if baseline.get("status") != "failing" or not baseline.get("baseline_reproduced"):
+                atomic_write_json(artifact_dir / "result.json", {
+                    "status": "invalid",
+                    "validation_error": baseline.get("validation_error") or "baseline_not_reproduced",
+                    "baseline": baseline,
+                })
+                print(json.dumps(
+                    {"status": "invalid", "baseline": baseline},
+                    indent=2,
+                    ensure_ascii=False,
+                ))
+                return 1
+        result = validator.validate_diff(
+            project=project,
+            diff=diff,
+            patch_paths=patch_paths,
+            artifact_dir=artifact_dir / "validation",
+            expected_sha256s=snapshot_hashes,
             failing_tests=failing_tests,
+            expected_plan_digest=(baseline or {}).get("plan_digest", ""),
+            expected_environment_digest=(baseline or {}).get("environment_digest", ""),
+            expected_image_digest=(baseline or {}).get("provisioned_image_digest", ""),
+            reusable_workspace=workspace,
         )
-        atomic_write_json(artifact_dir / "baseline.json", baseline)
-        if baseline.get("status") != "failing" or not baseline.get("baseline_reproduced"):
-            atomic_write_json(artifact_dir / "result.json", {
-                "status": "invalid",
-                "validation_error": baseline.get("validation_error") or "baseline_not_reproduced",
-                "baseline": baseline,
-            })
-            print(json.dumps({"status": "invalid", "baseline": baseline}, indent=2, ensure_ascii=False))
-            return 1
-    result = validator.validate_diff(
-        project=project,
-        diff=diff,
-        patch_paths=patch_paths,
-        artifact_dir=artifact_dir / "validation",
-        expected_sha256s=snapshot_hashes,
-        failing_tests=failing_tests,
-        expected_plan_digest=(baseline or {}).get("plan_digest", ""),
-        expected_environment_digest=(baseline or {}).get("environment_digest", ""),
-        expected_image_digest=(baseline or {}).get("provisioned_image_digest", ""),
-    )
+    result["input_project_restored"] = True
     if baseline is not None:
         result = classify_validation_result(baseline, result)
         result["baseline"] = baseline
@@ -841,6 +848,19 @@ def doctor(settings: Settings, project, jobs: int) -> int:
         print(f"[FAIL] CodeGraph context: {context.error}")
     else:
         print(f"[WARN] CodeGraph context unavailable; Codex fallback active: {context.error}")
+    try:
+        workspace_contract = ProjectWorkspace(
+            project,
+            settings.results_dir / safe_name(project.project_id, 100) / ".doctor-workspace",
+        ).preflight()
+        print(
+            "[OK] Workspace: in-place "
+            f"(git={workspace_contract['git']}, "
+            f"disposable={str(workspace_contract['disposable']).lower()})"
+        )
+    except RuntimeError as exc:
+        failures += 1
+        print(f"[FAIL] Workspace: {exc}")
     try:
         plan = validator.inspect(project)
         environment = validator.resolve_environment(project, plan)

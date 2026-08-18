@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import base64
+import fcntl
 import hashlib
+import json
+import os
 import re
 import shutil
 import subprocess
 import tempfile
-import uuid
 from pathlib import Path, PurePosixPath
 
-from src.utils.jsonio import safe_name
+from src.utils.project_config import load_project_config, load_project_config_file
 
 
 class WorkspaceError(RuntimeError):
@@ -24,6 +27,17 @@ class WorkspaceError(RuntimeError):
 C_CPP_PRODUCTION_EXTENSIONS = {
     ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".inc",
 }
+
+
+def source_extensions_for_project(project) -> set[str]:
+    config = (
+        load_project_config_file(project.config_path)
+        if project.config_path is not None
+        else load_project_config(Path(project.path).resolve())
+    )
+    extensions = set(C_CPP_PRODUCTION_EXTENSIONS)
+    extensions.update(config.repair.source_extensions)
+    return extensions
 
 TEST_PATH_COMPONENTS = {
     "test", "tests", "testing", "testsuite", "testcases", "spec", "specs",
@@ -168,10 +182,14 @@ def _normalize_hunk_counts(lines: list[str]) -> bool:
     return changed
 
 
-def is_production_source_path(value: object) -> bool:
+def is_production_source_path(
+    value: object,
+    source_extensions: set[str] | frozenset[str] | None = None,
+) -> bool:
     """Accept source files while rejecting tests and generated/build outputs."""
     relpath = normalize_relpath(value)
-    if not relpath or Path(relpath).suffix.lower() not in C_CPP_PRODUCTION_EXTENSIONS:
+    extensions = set(source_extensions or C_CPP_PRODUCTION_EXTENSIONS)
+    if not relpath or Path(relpath).suffix.lower() not in extensions:
         return False
     parts = [part.lower() for part in PurePosixPath(relpath).parts]
     if any(part in TEST_PATH_COMPONENTS | GENERATED_PATH_COMPONENTS for part in parts[:-1]):
@@ -185,27 +203,39 @@ def is_production_source_path(value: object) -> bool:
     )
 
 
-def non_repairable_patch_paths(values: list[str] | tuple[str, ...]) -> list[str]:
-    """Return paths that may change the validation oracle or are not C/C++ source.
+def non_repairable_patch_paths(
+    values: list[str] | tuple[str, ...],
+    source_extensions: set[str] | frozenset[str] | None = None,
+) -> list[str]:
+    """Return paths that may change the oracle or are not configured source.
 
     This is an enforcement boundary, not a prompt hint.  A path must be a
-    production C/C++ source/header according to both the repository path policy
-    and the extension allowlist before its patch can be classified plausible.
+    production source/header according to both the repository path policy and
+    the extension allowlist before its patch can be classified plausible.
     """
+    extensions = set(source_extensions or C_CPP_PRODUCTION_EXTENSIONS)
     blocked: list[str] = []
     for value in values:
         relpath = normalize_relpath(value)
         if (
             not relpath
-            or Path(relpath).suffix.lower() not in C_CPP_PRODUCTION_EXTENSIONS
-            or not is_production_source_path(relpath)
+            or Path(relpath).suffix.lower() not in extensions
+            or not is_production_source_path(relpath, extensions)
         ):
             blocked.append(relpath or str(value))
     return sorted(dict.fromkeys(blocked))
 
 
 class ProjectWorkspace:
-    """A reusable, disposable snapshot for repair attempts and validation."""
+    """Operate on the supplied project through a recoverable Git baseline.
+
+    The source tree is never copied. Existing repositories must be completely
+    clean. A non-Git source export is accepted only when its project contract
+    explicitly marks it disposable and authorizes creating temporary Git
+    metadata. Every attempt starts from the same baseline commit and ``close``
+    restores the caller's original branch/HEAD or removes framework-created
+    Git metadata.
+    """
 
     def __init__(self, project, workspace_parent: Path):
         self.project = project
@@ -216,106 +246,397 @@ class ProjectWorkspace:
         except ValueError:
             pass
         else:
-            self.parent = (
-                Path(tempfile.gettempdir()).resolve() / "debugging-framework-llm"
-            )
-        self.path = self.parent / f"{safe_name(project.project_id, 70)}-{uuid.uuid4().hex[:10]}"
+            raise WorkspaceError("Workspace metadata phải nằm ngoài project input")
+        self.path = self.owner
         self.snapshot_commit = ""
+        self.original_head = ""
+        self.original_branch = ""
+        self.framework_created_git = False
+        self._entered = False
+        self._restored = False
+        self._lock_handle = None
+        self._exclude_path: Path | None = None
+        self._exclude_existed = False
+        self._exclude_content = b""
+        # ``workspace_parent`` itself is transient and is intentionally removed
+        # between runs. Keep recovery state one level above it so an interrupted
+        # in-place repair can be recovered before the next attempt starts.
+        self._recovery_path = self.parent.parent / "workspace-recovery.json"
+        config = (
+            load_project_config_file(project.config_path)
+            if project.config_path is not None
+            else load_project_config(self.owner)
+        )
+        self.workspace_config = config.workspace
+        self.source_extensions = source_extensions_for_project(project)
 
     def __enter__(self) -> "ProjectWorkspace":
-        if not self.owner.is_dir():
-            raise WorkspaceError(f"Project không tồn tại: {self.owner}")
-        self.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.exists():
-            raise WorkspaceError(f"Workspace target đã tồn tại: {self.path}")
-        shutil.copytree(
-            self.owner,
-            self.path,
-            symlinks=True,
-            ignore=self._llm_ignored_paths,
-        )
+        self.reserve()
+        self._entered = True
         try:
-            self._initialize_snapshot_repository()
+            if self._git_root() is None:
+                if not (
+                    self.workspace_config.disposable
+                    and self.workspace_config.initialize_git_if_missing
+                ):
+                    raise WorkspaceError(
+                        "Project không phải Git repository; chỉ source disposable được phép "
+                        "tự tạo baseline bằng workspace.disposable=true và "
+                        "workspace.initialize_git_if_missing=true"
+                    )
+                self._initialize_disposable_repository()
+            else:
+                self._prepare_existing_repository()
+            # Persist the baseline immediately after detaching. Rewrite it after
+            # installing excludes so their exact original bytes are recoverable.
+            self._write_recovery_metadata()
+            self._install_framework_excludes()
+            self._write_recovery_metadata()
+            self._assert_production_sources()
         except BaseException:
             self.close()
             raise
         return self
 
+    def reserve(self) -> None:
+        """Lock the project and recover a previously interrupted run.
+
+        A pipeline reserves before touching its result directory, preventing a
+        concurrent invocation from deleting artifacts owned by the active run.
+        ``__enter__`` reuses the reservation and keeps it through restoration.
+        """
+        if self._lock_handle is not None:
+            return
+        if not self.owner.is_dir():
+            raise WorkspaceError(f"Project không tồn tại: {self.owner}")
+        self.parent.mkdir(parents=True, exist_ok=True)
+        self._acquire_lock()
+        try:
+            self._recover_interrupted_run()
+        except BaseException:
+            self._release_lock()
+            raise
+
+    def release_reservation(self) -> None:
+        """Release a reservation that has not entered an in-place repair."""
+        if not self._entered:
+            self._release_lock()
+
+    def preflight(self) -> dict[str, object]:
+        """Check the in-place contract without changing the supplied project."""
+        if not self.owner.is_dir():
+            raise WorkspaceError(f"Project không tồn tại: {self.owner}")
+        root = self._git_root()
+        if root is None:
+            if not (
+                self.workspace_config.disposable
+                and self.workspace_config.initialize_git_if_missing
+            ):
+                raise WorkspaceError(
+                    "Project không phải Git repository và chưa được cho phép tạo "
+                    "disposable baseline"
+                )
+            return {
+                "mode": "in_place",
+                "git": "initialize-temporary",
+                "disposable": True,
+            }
+        if root != self.owner:
+            raise WorkspaceError(
+                f"Project phải là Git worktree root, không phải thư mục con: {self.owner}"
+            )
+        status = self._git_text(
+            "status", "--porcelain=v1", "--untracked-files=all", timeout=60
+        )
+        if status.strip():
+            raise WorkspaceError(
+                "Git project phải sạch trước repair (tracked và untracked); "
+                "hãy commit/stash hoặc dùng một clone riêng"
+            )
+        ignored = self._git_text(
+            "status", "--porcelain=v1", "--ignored=matching", "--untracked-files=all",
+            timeout=60,
+        )
+        ignored_entries = [
+            line
+            for line in ignored.splitlines()
+            if line.startswith("!! ") and line[3:].rstrip("/") != ".debugging-framework"
+        ]
+        if ignored_entries and not self.workspace_config.disposable:
+            preview = ", ".join(line[3:] for line in ignored_entries[:5])
+            raise WorkspaceError(
+                "Git project có ignored files nên không thể bảo đảm khôi phục in-place; "
+                f"hãy dùng clone sạch (ví dụ: {preview})"
+            )
+        head = self._git_text(
+            "rev-parse", "--verify", "HEAD", timeout=30, allow_failure=True
+        ).strip()
+        if not head:
+            raise WorkspaceError("Git project chưa có commit baseline")
+        return {
+            "mode": "in_place",
+            "git": "existing",
+            "disposable": self.workspace_config.disposable,
+            "head": head,
+        }
+
     def __exit__(self, exc_type, exc, traceback) -> None:
         self.close()
 
     def close(self) -> None:
-        if not self.path.exists():
+        if not self._entered:
             return
-        resolved = self.path.resolve()
-        if resolved.parent != self.parent or not resolved.name.startswith(
-            safe_name(self.project.project_id, 70) + "-"
-        ):
-            raise WorkspaceError(f"Từ chối xoá workspace path không mong đợi: {resolved}")
-        shutil.rmtree(resolved)
+        restore_error: Exception | None = None
+        try:
+            if self.snapshot_commit and (self.owner / ".git").exists():
+                self._restore_baseline(remove_generated=True)
+                if not self.framework_created_git:
+                    if self.original_branch:
+                        self._run_git("checkout", "-f", self.original_branch, timeout=120)
+                    elif self.original_head:
+                        self._run_git(
+                            "checkout", "--detach", "-f", self.original_head, timeout=120
+                        )
+                    if self.original_head:
+                        self._run_git("reset", "--hard", self.original_head, timeout=120)
+                self._restored = True
+            self._restore_framework_excludes()
+            if self.framework_created_git:
+                if (self.owner / ".git").is_dir():
+                    shutil.rmtree(self.owner / ".git")
+                if not self.snapshot_commit:
+                    # Initialization failed before a baseline commit existed;
+                    # only framework-owned Git metadata could have changed.
+                    self._restored = True
+            if self._restored and self._recovery_path.exists():
+                self._recovery_path.unlink()
+        except Exception as exc:  # keep recovery.json and temporary Git metadata
+            restore_error = exc
+        finally:
+            self._release_lock()
+            self._entered = False
+        if restore_error is not None:
+            raise WorkspaceError(f"Không khôi phục được project input: {restore_error}") from restore_error
 
-    def _initialize_snapshot_repository(self) -> None:
+    @property
+    def restored(self) -> bool:
+        return self._restored
+
+    def _initialize_disposable_repository(self) -> None:
+        self.framework_created_git = True
+        # This phase can be expensive for a very large export. Record ownership
+        # before creating Git metadata so interruption during add/commit is safe.
+        self._write_recovery_metadata()
         self._run_git("init", timeout=60)
         self._run_git("config", "user.name", "Debugging Framework", timeout=30)
         self._run_git("config", "user.email", "debugging-framework@example.invalid", timeout=30)
-        (self.path / ".git" / "info" / "exclude").write_text(
-            "node_modules/\n.venv/\nvenv/\ntarget/\nbuild/\ndist/\n"
-            ".codegraph/\n"
-            "codegraph.json\n"
-            ".debugging-framework/build/\n.debugging-framework/environment/\n"
-            ".debugging-framework/venv/\n.debugging-framework/bundle/\n"
-            ".debugging-framework/baseline-output.txt\n",
-            encoding="utf-8",
-        )
         files = [
             path.relative_to(self.path).as_posix()
             for path in self.path.rglob("*")
-            if path.is_file()
-            and not path.is_symlink()
+            if (path.is_file() or path.is_symlink())
             and ".git" not in path.relative_to(self.path).parts
             and not any(
-                part in {"node_modules", ".venv", "venv", "target", "build", "dist"}
-                for part in path.relative_to(self.path).parts[:-1]
+                part in {".codegraph", ".debugging-framework"}
+                for part in path.relative_to(self.path).parts
             )
+            and path.relative_to(self.path).as_posix() != "codegraph.json"
         ]
-        if not any(is_production_source_path(path) for path in files):
-            raise WorkspaceError("Project không có production source file được hỗ trợ")
         for offset in range(0, len(files), 500):
             self._run_git("add", "-f", "--", *files[offset : offset + 500], timeout=120)
         self._run_git("commit", "--no-gpg-sign", "-m", "Project snapshot", timeout=180)
         self.snapshot_commit = self._git_text("rev-parse", "HEAD", timeout=30).strip()
         if not self.snapshot_commit:
             raise WorkspaceError("Không xác định được commit của project snapshot")
+        self._run_git("checkout", "--detach", "-f", self.snapshot_commit, timeout=120)
 
-    def _llm_ignored_paths(self, directory: str, names: list[str]) -> set[str]:
-        current = Path(directory).resolve()
-        try:
-            relative = current.relative_to(self.owner)
-        except ValueError:
-            return set()
-        ignored = {
-            name for name in names
-            if name in {
-                "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
-            }
+    def _prepare_existing_repository(self) -> None:
+        contract = self.preflight()
+        self.original_head = str(contract["head"])
+        self.original_branch = self._git_text(
+            "symbolic-ref", "--quiet", "--short", "HEAD", timeout=30, allow_failure=True
+        ).strip()
+        self.snapshot_commit = self.original_head
+        # Preserve the caller's branch before detaching; even a process kill
+        # immediately after checkout can then restore the exact original state.
+        self._write_recovery_metadata()
+        self._run_git("checkout", "--detach", "-f", self.snapshot_commit, timeout=120)
+
+    def _assert_production_sources(self) -> None:
+        files = self._git_paths("ls-tree", "-r", "--name-only", self.snapshot_commit)
+        if not any(is_production_source_path(path, self.source_extensions) for path in files):
+            raise WorkspaceError("Project không có production source file được hỗ trợ")
+
+    def _git_root(self) -> Path | None:
+        output = self._git_text(
+            "rev-parse", "--show-toplevel", timeout=30, allow_failure=True
+        ).strip()
+        return Path(output).resolve() if output else None
+
+    def _install_framework_excludes(self) -> None:
+        raw_path = self._git_text("rev-parse", "--git-path", "info/exclude", timeout=30).strip()
+        exclude_path = Path(raw_path)
+        if not exclude_path.is_absolute():
+            exclude_path = self.owner / exclude_path
+        self._exclude_path = exclude_path.resolve()
+        self._exclude_existed = self._exclude_path.exists()
+        self._exclude_content = self._exclude_path.read_bytes() if self._exclude_existed else b""
+        self._exclude_path.parent.mkdir(parents=True, exist_ok=True)
+        current = self._exclude_content.decode("utf-8", errors="replace")
+        suffix = "\n# Debugging Framework runtime artifacts\n.codegraph/\ncodegraph.json\n.debugging-framework/\n"
+        self._exclude_path.write_text(current.rstrip("\n") + suffix, encoding="utf-8")
+
+    def _restore_framework_excludes(self) -> None:
+        if self._exclude_path is None:
+            return
+        if self._exclude_existed:
+            self._exclude_path.write_bytes(self._exclude_content)
+        elif self._exclude_path.exists():
+            self._exclude_path.unlink()
+        self._exclude_path = None
+
+    def _write_recovery_metadata(self) -> None:
+        value = {
+            "schema_version": 1,
+            "phase": "active" if self.snapshot_commit else "initializing",
+            "project": str(self.owner),
+            "snapshot_commit": self.snapshot_commit,
+            "original_head": self.original_head,
+            "original_branch": self.original_branch,
+            "framework_created_git": self.framework_created_git,
+            "exclude_recorded": self._exclude_path is not None,
+            "exclude_existed": self._exclude_existed,
+            "exclude_content_base64": base64.b64encode(
+                self._exclude_content
+            ).decode("ascii"),
         }
-        if relative == Path("."):
-            ignored.update(
-                name for name in names
-                if name in {".git", ".env", ".codegraph", "build", "dist", "target"}
+        temporary = self._recovery_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(self._recovery_path)
+
+    def _recover_interrupted_run(self) -> None:
+        """Restore an interrupted in-place run before creating a new baseline."""
+        if not self._recovery_path.is_file():
+            return
+        try:
+            value = json.loads(self._recovery_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise WorkspaceError(
+                f"Không đọc được recovery metadata: {self._recovery_path}"
+            ) from exc
+        if str(value.get("project") or "") != str(self.owner):
+            raise WorkspaceError(
+                "Recovery metadata không thuộc project hiện tại; không tự động thay đổi source"
             )
-        elif ".git" in names:
-            ignored.add(".git")
-        if relative.as_posix() == ".debugging-framework":
-            ignored.update({"build", "environment", "venv", "bundle", "cache"})
-            ignored.update(
-                name for name in names
-                if Path(name).suffix.lower() in {".log", ".xml", ".status", ".msg"}
+
+        framework_created = bool(value.get("framework_created_git", False))
+        git_entry = self.owner / ".git"
+        if not git_entry.exists():
+            # A temporary repository is removed only after its source has already
+            # been reset. A crash between that removal and unlinking metadata is
+            # therefore safe to finish here.
+            if framework_created:
+                self._recovery_path.unlink()
+                return
+            raise WorkspaceError(
+                "Project Git đã biến mất trong khi còn recovery metadata; "
+                "cần kiểm tra thủ công"
             )
-        return ignored
+
+        self.snapshot_commit = str(value.get("snapshot_commit") or "").strip()
+        self.original_head = str(value.get("original_head") or "").strip()
+        self.original_branch = str(value.get("original_branch") or "").strip()
+        self.framework_created_git = framework_created
+        if not self.snapshot_commit:
+            if framework_created:
+                # No source edit happens before the temporary baseline commit.
+                # Remove a partial init/index/object database and retry cleanly.
+                if git_entry.is_dir():
+                    shutil.rmtree(git_entry)
+                self._recovery_path.unlink()
+                self.framework_created_git = False
+                return
+            raise WorkspaceError("Recovery metadata thiếu snapshot_commit")
+        recovered_commit = self._git_text(
+            "rev-parse", "--verify", f"{self.snapshot_commit}^{{commit}}",
+            timeout=30, allow_failure=True,
+        ).strip()
+        if not recovered_commit:
+            raise WorkspaceError("Không còn commit baseline để tự phục hồi project")
+
+        if bool(value.get("exclude_recorded", False)):
+            raw_path = self._git_text(
+                "rev-parse", "--git-path", "info/exclude", timeout=30
+            ).strip()
+            exclude_path = Path(raw_path)
+            if not exclude_path.is_absolute():
+                exclude_path = self.owner / exclude_path
+            self._exclude_path = exclude_path.resolve()
+            self._exclude_existed = bool(value.get("exclude_existed", False))
+            encoded = str(value.get("exclude_content_base64") or "")
+            try:
+                self._exclude_content = base64.b64decode(encoded, validate=True)
+            except ValueError as exc:
+                raise WorkspaceError("Recovery metadata chứa exclude backup lỗi") from exc
+
+        try:
+            self._restore_baseline(remove_generated=True)
+            if not framework_created:
+                if self.original_branch:
+                    self._run_git("checkout", "-f", self.original_branch, timeout=120)
+                elif self.original_head:
+                    self._run_git(
+                        "checkout", "--detach", "-f", self.original_head, timeout=120
+                    )
+                if self.original_head:
+                    self._run_git("reset", "--hard", self.original_head, timeout=120)
+            self._restore_framework_excludes()
+            if framework_created and git_entry.is_dir():
+                shutil.rmtree(git_entry)
+            self._recovery_path.unlink()
+        except Exception as exc:
+            raise WorkspaceError(
+                f"Không tự phục hồi được repair bị ngắt: {exc}"
+            ) from exc
+        finally:
+            # A successful recovery is followed by a completely fresh baseline.
+            # On failure these values are also retained in recovery.json itself.
+            self.snapshot_commit = ""
+            self.original_head = ""
+            self.original_branch = ""
+            self.framework_created_git = False
+            self._exclude_path = None
+            self._exclude_existed = False
+            self._exclude_content = b""
+            self._restored = False
+
+    def _acquire_lock(self) -> None:
+        lock_root = Path(tempfile.gettempdir()).resolve() / "debugging-framework-locks"
+        lock_root.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(str(self.owner).encode("utf-8")).hexdigest()[:24]
+        lock_path = lock_root / f"{digest}.lock"
+        handle = lock_path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            handle.close()
+            raise WorkspaceError(f"Project đang được một repair khác sử dụng: {self.owner}") from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()}\nproject={self.owner}\n")
+        handle.flush()
+        self._lock_handle = handle
+
+    def _release_lock(self) -> None:
+        if self._lock_handle is None:
+            return
+        try:
+            fcntl.flock(self._lock_handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._lock_handle.close()
+            self._lock_handle = None
 
     def reset_to_snapshot(self) -> None:
-        """Restore the owned workspace without touching the input project.
+        """Restore the supplied project to the repair run's baseline.
 
         CodeGraph's repository index is retained because it is read-only navigation
         metadata and can be reused across attempts. All tracked edits, intent-to-add
@@ -323,11 +644,35 @@ class ProjectWorkspace:
         """
         if not self.snapshot_commit:
             raise WorkspaceError("Project snapshot chưa được khởi tạo")
+        self._run_git("checkout", "--detach", "-f", self.snapshot_commit, timeout=120)
         self._run_git("reset", "--hard", self.snapshot_commit, timeout=120)
         self._run_git(
             "clean", "-ffdx", "-e", ".codegraph/", "-e", "codegraph.json",
+            "-e", ".debugging-framework/",
             timeout=180,
         )
+        self._clean_framework_runtime()
+
+    def _restore_baseline(self, *, remove_generated: bool) -> None:
+        self._run_git("checkout", "--detach", "-f", self.snapshot_commit, timeout=120)
+        self._run_git("reset", "--hard", self.snapshot_commit, timeout=120)
+        arguments = ["clean", "-ffdx", "-e", ".debugging-framework/"]
+        if not remove_generated:
+            arguments.extend(["-e", ".codegraph/", "-e", "codegraph.json"])
+        self._run_git(*arguments, timeout=180)
+        self._clean_framework_runtime()
+
+    def _clean_framework_runtime(self) -> None:
+        root = self.owner / ".debugging-framework"
+        for name in ("build", "environment", "venv", "bundle", "cache"):
+            path = root / name
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            elif path.exists() or path.is_symlink():
+                path.unlink()
+        baseline = root / "baseline-output.txt"
+        if baseline.exists() or baseline.is_symlink():
+            baseline.unlink()
 
     def canonical_diff(self) -> str:
         """Return the exact Git diff represented by the workspace filesystem.
@@ -421,88 +766,18 @@ class ProjectWorkspace:
     def _run_git(self, *arguments: str, timeout: int) -> None:
         self._git_text(*arguments, timeout=timeout)
 
-    def _git_text(self, *arguments: str, timeout: int) -> str:
+    def _git_text(self, *arguments: str, timeout: int, allow_failure: bool = False) -> str:
         completed = subprocess.run(
             ["git", "-C", str(self.path), *arguments],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             encoding="utf-8", errors="replace", timeout=timeout, check=False,
         )
-        if completed.returncode != 0:
+        if completed.returncode != 0 and not allow_failure:
             detail = (completed.stderr or completed.stdout).strip().splitlines()
             raise WorkspaceError(
                 f"git {' '.join(arguments[:3])} lỗi: {detail[-1] if detail else 'unknown'}"
             )
         return completed.stdout
-
-
-class ValidationWorkspace:
-    """A disposable project copy used for build/test without touching the input."""
-
-    def __init__(self, project):
-        self.project = project
-        self.owner = Path(project.path).resolve()
-        self.parent = Path(tempfile.gettempdir()).resolve() / "debugging-framework-validation"
-        self.path = self.parent / f"{safe_name(project.project_id, 70)}-{uuid.uuid4().hex[:10]}"
-
-    def __enter__(self) -> "ValidationWorkspace":
-        if not self.owner.is_dir():
-            raise WorkspaceError(f"Project không tồn tại: {self.owner}")
-        self.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.exists():
-            raise WorkspaceError(f"Validation workspace đã tồn tại: {self.path}")
-        shutil.copytree(
-            self.owner,
-            self.path,
-            symlinks=True,
-            ignore=self._ignored_paths,
-        )
-        return self
-
-    def __exit__(self, exc_type, exc, traceback) -> None:
-        self.close()
-
-    def close(self) -> None:
-        if not self.path.exists():
-            return
-        resolved = self.path.resolve()
-        if resolved.parent != self.parent or not resolved.name.startswith(
-            safe_name(self.project.project_id, 70) + "-"
-        ):
-            raise WorkspaceError(f"Từ chối xoá validation workspace: {resolved}")
-        shutil.rmtree(resolved)
-
-    def apply_unified_diff(self, diff: str, expected_paths: list[str] | None = None) -> list[str]:
-        return _apply_unified_diff(self.path, diff, expected_paths)
-
-    def _ignored_paths(self, directory: str, names: list[str]) -> set[str]:
-        current = Path(directory).resolve()
-        try:
-            relative = current.relative_to(self.owner)
-        except ValueError:
-            return set()
-        ignored = {
-            name for name in names
-            if name in {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
-        }
-        # A real .git directory is copied so version-derived builds keep working,
-        # but a worktree/submodule .git pointer is excluded because it can write
-        # back into the input repository's administrative directory.
-        if ".git" in names and not (relative == Path(".") and (self.owner / ".git").is_dir()):
-            ignored.add(".git")
-        if relative == Path("."):
-            ignored.update(name for name in names if name in {"build", "dist", "target"})
-            ignored.update(
-                child.name
-                for child in self.owner.iterdir()
-                if child.is_dir() and (child / "CMakeCache.txt").is_file()
-            )
-        if relative.as_posix() == ".debugging-framework":
-            ignored.update({"build", "environment", "venv", "bundle", "cache"})
-            ignored.update(
-                name for name in names
-                if Path(name).suffix.lower() in {".log", ".xml", ".status", ".msg"}
-            )
-        return ignored
 
 
 def _apply_unified_diff(

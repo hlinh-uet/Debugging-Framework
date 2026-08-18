@@ -1,8 +1,9 @@
 # Debugging Framework
 
 Framework tự động **Fault Localization (FL)** và **Automated Program Repair
-(APR)** cho project C/C++. Codex sửa một snapshot tạm; framework lấy Git diff
-trực tiếp từ filesystem, reset snapshot rồi apply và chạy test trước khi trả kết quả.
+(APR)** cho project C/C++. Codex sửa trực tiếp Git project do caller cung cấp;
+framework lấy Git diff từ filesystem, reset baseline rồi apply và chạy test trước
+khi trả kết quả, sau đó khôi phục branch/HEAD ban đầu.
 
 CodeGraph 1.5.0 đã được đóng gói sẵn để hỗ trợ Codex điều hướng source code.
 Người dùng không cần cài Node.js, npm, npx hoặc CodeGraph riêng.
@@ -19,10 +20,10 @@ Người dùng không cần cài Node.js, npm, npx hoặc CodeGraph riêng.
 Framework không tự cài dependency, không tự build/pull image và không tự đổi
 giữa `host` và `image`.
 
-Trên macOS với Docker Desktop, validation copy snapshot vào filesystem Linux
+Trên macOS với Docker Desktop, validation copy project vào filesystem Linux
 tạm trong container trước khi chạy command rồi đồng bộ artifact trở lại. Cách
 này giữ đúng POSIX permission semantics cho các test dùng `access(2)`/`stat(2)`;
-project đầu vào vẫn không bị sửa vì thao tác diễn ra trên validation snapshot.
+đây là chi tiết của image backend, không tạo thêm source workspace trên host.
 
 ## Cài đặt
 
@@ -39,7 +40,7 @@ Wheel đã chứa CodeGraph cho macOS ARM64 và Linux x64. Trên platform khác,
 FL/APR.
 
 CodeGraph mặc định là zero-config: framework tự chọn runtime bundled, tạo index
-non-interactive trong snapshot, kiểm tra index rồi đưa lệnh `codegraph` vào phiên
+non-interactive trong project baseline, kiểm tra index rồi đưa lệnh `codegraph` vào phiên
 Codex. Framework không cài Git hook, daemon hoặc cấu hình CodeGraph toàn cục trên
 máy đối tác.
 
@@ -84,7 +85,8 @@ tạo thư mục chứa failure log:
 ```
 
 Đối tác cần kiểm tra lại `setup`, `build` và đặc biệt là `regression_test` trước
-khi chạy repair. Ví dụ contract CMake/CTest:
+khi chạy repair, rồi commit contract và `.gitignore` để working tree sạch. Failure
+log trong `.debugging-framework/` có thể giữ ignored. Ví dụ contract CMake/CTest:
 
 ```json
 {
@@ -143,13 +145,34 @@ debugging-framework repair \
 Framework sẽ:
 
 1. Nhận failure log và failing test IDs do caller cung cấp, không chạy source gốc.
-2. Copy project đúng một lần sang snapshot tạm dùng chung cho các attempt và chuẩn bị CodeGraph nếu khả dụng.
-3. Trước mỗi attempt, reset snapshot; cho Codex thực hiện FL và APR từ failure log đã cung cấp.
-4. Lấy canonical Git diff từ thay đổi thật trong workspace, reset rồi apply diff đó để setup/build/test.
+2. Khóa Git project sạch do caller cung cấp, ghi branch/HEAD recovery metadata và chuẩn bị CodeGraph nếu khả dụng.
+3. Trước mỗi attempt, reset về baseline; cho Codex thực hiện FL và APR trực tiếp trong project từ failure log đã cung cấp.
+4. Lấy canonical Git diff từ thay đổi thật, reset rồi apply diff đó để setup/build/test.
 5. Nếu có `target_test`, chạy nó trước; target fail sẽ chuyển feedback sang attempt sau.
 6. Chỉ khi target pass mới chạy `regression_test` full suite.
 7. Nếu không có `target_test`, chạy thẳng full suite cho mỗi attempt.
 8. Ghi patch được chọn vào `/tmp/fix.patch`.
+9. Khôi phục branch/HEAD ban đầu và dọn build/runtime artifact do run tạo.
+
+Framework không copy source tree. Git project của đối tác phải sạch và không có
+ignored artifact, trừ `.debugging-framework/`. Nếu caller cung cấp một source
+export không có Git, config phải xác nhận rõ đây là dữ liệu disposable:
+
+```json
+{
+  "workspace": {
+    "disposable": true,
+    "initialize_git_if_missing": true
+  }
+}
+```
+
+Khi đó framework tạo Git baseline tạm ngay trong source export và xóa metadata
+đó sau khi khôi phục project. Adapter benchmark như Defects4C dùng chế độ này.
+Trong lúc chạy, metadata khôi phục nằm ở
+`<results>/<project>/workspace-recovery.json`; nếu process/SSH bị ngắt, lần
+repair tiếp theo sẽ giữ cùng project lock và tự khôi phục baseline trước khi
+đụng tới artifact của run mới.
 
 ### Bước 5: xem kết quả
 
@@ -212,7 +235,8 @@ Phần lớn cấu hình của một job nên đặt trong `.debugging-framework
     "model": "gpt-5.6-sol",
     "codex_timeout": 1800,
     "command_timeout": 1800,
-    "jobs": 4
+    "jobs": 4,
+    "source_extensions": [".re"]
   },
   "environment": {
     "mode": "host"

@@ -44,7 +44,7 @@ class PipelineOptions:
 
 
 class DebuggingPipeline:
-    """Project-in repair pipeline with raw diff retention and isolated validation."""
+    """In-place repair pipeline with canonical diff retention and restoration."""
 
     def __init__(
         self,
@@ -69,8 +69,14 @@ class DebuggingPipeline:
         self._require_outside_input(project_root, project_results, "results")
         self._require_outside_input(project_root, output_patch, "patch output")
         self._verify_file_inputs(options)
-        self._prepare_project_results(project_results)
-        self._prepare_output_target(output_patch)
+        workspace_manager = ProjectWorkspace(project, project_results / "workspaces")
+        workspace_manager.reserve()
+        try:
+            self._prepare_project_results(project_results)
+            self._prepare_output_target(output_patch)
+        except BaseException:
+            workspace_manager.release_reservation()
+            raise
 
         print("[baseline] dùng failure log và test ID do caller cung cấp; không chạy source gốc")
         try:
@@ -101,27 +107,32 @@ class DebuggingPipeline:
                 "attempts": [],
                 "fault_localization": {},
             }
+            workspace_manager.release_reservation()
             return self._finish(project_results, result)
 
-        runner = self.runner_factory(
-            executable=self.settings.codex_executable,
-            schema_path=self.settings.output_schema,
-            api_key=getattr(self.settings, "codex_api_key", ""),
-            provider=getattr(self.settings, "codex_provider", ""),
-            base_url=getattr(self.settings, "codex_base_url", ""),
-            wire_api=getattr(self.settings, "codex_wire_api", "responses"),
-            env_key=getattr(self.settings, "codex_env_key", "CODEX_API_KEY"),
-            model=options.model,
-            timeout_seconds=options.codex_timeout_seconds,
-            inherit_user_config=options.inherit_codex_config,
-        )
-        context_backend = self.context_factory.from_settings(self.settings)
+        try:
+            runner = self.runner_factory(
+                executable=self.settings.codex_executable,
+                schema_path=self.settings.output_schema,
+                api_key=getattr(self.settings, "codex_api_key", ""),
+                provider=getattr(self.settings, "codex_provider", ""),
+                base_url=getattr(self.settings, "codex_base_url", ""),
+                wire_api=getattr(self.settings, "codex_wire_api", "responses"),
+                env_key=getattr(self.settings, "codex_env_key", "CODEX_API_KEY"),
+                model=options.model,
+                timeout_seconds=options.codex_timeout_seconds,
+                inherit_user_config=options.inherit_codex_config,
+            )
+            context_backend = self.context_factory.from_settings(self.settings)
+        except BaseException:
+            workspace_manager.release_reservation()
+            raise
         attempts: list[dict] = []
         candidates: list[dict] = []
         payloads: list[dict] = []
         workspace_patches: list[dict] = []
         previous_feedback: dict | None = None
-        with ProjectWorkspace(project, project_results / "workspaces") as workspace:
+        with workspace_manager as workspace:
             for attempt_index in range(1, options.attempts + 1):
                 print(f"[attempt {attempt_index}/{options.attempts}] Codex đọc project và tạo patch")
                 attempt_dir = project_results / "attempts" / f"attempt_{attempt_index:02d}"
@@ -358,6 +369,9 @@ class DebuggingPipeline:
                 "attempts": attempts,
                 "fault_localization": self._fault_localization(payloads),
             }
+        result["input_project_restored"] = True
+        if isinstance(result.get("validation"), dict):
+            result["validation"]["input_project_restored"] = True
         return self._finish(project_results, result)
 
     @staticmethod
@@ -408,6 +422,7 @@ class DebuggingPipeline:
                     "post_passed_tests", "post_failed_tests", "failure_output",
                     "validation_workspace_isolated", "validation_process_sandboxed",
                     "input_project_untouched",
+                    "input_project_restored",
                     "test_oracle_modified", "blocked_patch_paths",
                     "patch_paths",
                     "failed_test_ids", "passed_test_ids", "test_id_granularity",

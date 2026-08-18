@@ -103,7 +103,7 @@ def build_codex_prompt(
         )
         if baseline
         else
-        "The framework has copied the project here. The environment is prepared by the "
+        "The framework is operating on a recoverable Git baseline. The environment is prepared by the "
         "caller; do not install dependencies or alter its environment contract."
     )
     investigation_context = (
@@ -119,8 +119,9 @@ def build_codex_prompt(
     )
 
     workspace_description = (
-        "This is a reusable, disposable, writable snapshot of the input project. The "
-        "framework resets it to the original snapshot before each repair attempt."
+        "This is the caller-supplied project on a recoverable, writable Git baseline. The "
+        "framework resets it to that baseline before each repair attempt and restores it "
+        "when the run finishes."
     )
     repository_context = str(repository_context or "").strip()
     repository_navigation = (
@@ -130,8 +131,8 @@ def build_codex_prompt(
     )
     return f"""You are a software engineer performing fault localization and program repair.
 {workspace_description} {workflow_context}
-The framework will extract the exact Git diff from your workspace changes, reset the
-snapshot, and independently validate that diff. The input project is never modified.
+The framework will extract the exact Git diff from your project changes, reset the
+baseline, independently validate that diff, and restore the supplied project afterward.
 
 {investigation_context}
 {known_failure}
@@ -142,7 +143,7 @@ invariants; implement and test the smallest root-cause repair.
 Constraints:
 - Do not browse for solutions or use git history, hidden accepted fixes, ground truth,
   or external source artifacts. Do not use the network to provision dependencies.
-- The repair diff may modify only production C/C++ source/header files. Do not modify
+- The repair diff may modify only configured production source/header files. Do not modify
   tests, fixtures, build files, scripts, Dockerfiles, project configuration, or validation
   commands. You may run the project's existing build/tests.
 - Never install dependencies or host/system packages, change the selected environment,

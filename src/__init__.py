@@ -1,1 +1,1 @@
-"""Automated C/C++ repair framework with isolated patch validation."""
+"""Automated repair framework with recoverable in-place patch validation."""
