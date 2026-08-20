@@ -170,3 +170,59 @@ Inspect the project, implement and test the repair in this workspace, review the
 actual workspace changes, then return JSON with exactly `summary`,
 `fault_localization`, and `repair`.
 """
+
+
+def build_codex_retry_prompt(
+    *,
+    project_id: str,
+    attempt: int,
+    feedback: dict,
+    previous_patch_reapplied: bool,
+) -> str:
+    """Build a compact follow-up for a resumed Codex repair thread.
+
+    The first turn already contains the failure evidence, repository navigation
+    instructions, and the agent's investigation. A retry should preserve that
+    reasoning instead of embedding the baseline and previous diff again.
+    """
+    workspace_state = (
+        "The framework reset the project to its clean baseline and reapplied your "
+        "previous candidate patch. The current filesystem therefore contains that "
+        "candidate; modify it in place."
+        if previous_patch_reapplied
+        else
+        "The framework reset the project to its clean baseline. No previous candidate "
+        "could be safely reapplied, so inspect the current Git diff before editing."
+    )
+    compact_feedback = {
+        "error": feedback.get("error", ""),
+        "outcome": feedback.get("outcome", ""),
+        "failed_tests": feedback.get("failed_tests", []),
+        "failure_excerpt": _clip(
+            feedback.get("failure_excerpt") or feedback.get("test_output") or "",
+            6_000,
+        ),
+        "candidate_paths": feedback.get("candidate_paths", []),
+        "previous_summary": _clip(feedback.get("previous_summary", ""), 1_500),
+        "previous_description": _clip(feedback.get("previous_description", ""), 1_500),
+    }
+    compact_feedback = {
+        key: value for key, value in compact_feedback.items()
+        if value not in ("", [], None)
+    }
+    return f"""Continue the same program-repair task in this existing Codex thread.
+
+{workspace_state}
+
+Independent validation feedback:
+{json.dumps(compact_feedback, ensure_ascii=False, indent=2)}
+
+Use the investigation and repository evidence already established in this thread.
+Do not restart repository-wide exploration or rerun CodeGraph unless the validation
+feedback disproves the current fault location. Diagnose the validation delta, adjust
+the smallest root-cause repair, review the actual workspace changes, and return valid
+JSON matching the existing output schema. Do not transcribe a diff or claim tests pass.
+
+Run context:
+{json.dumps({"project_id": project_id, "attempt": attempt}, ensure_ascii=False, indent=2)}
+"""

@@ -9,7 +9,7 @@ from typing import Optional
 
 from src.core.codex_runner import CodexRunner
 from src.core.context_layer import CodeGraphBackend
-from src.core.prompts import build_codex_prompt
+from src.core.prompts import build_codex_prompt, build_codex_retry_prompt
 from src.utils.jsonio import atomic_write_json, atomic_write_text, safe_name
 from src.utils.workspace import (
     ProjectWorkspace,
@@ -132,6 +132,10 @@ class DebuggingPipeline:
         payloads: list[dict] = []
         workspace_patches: list[dict] = []
         previous_feedback: dict | None = None
+        previous_patch = ""
+        previous_patch_paths: list[str] = []
+        codex_thread_id = ""
+        context_preparation = None
         with workspace_manager as workspace:
             for attempt_index in range(1, options.attempts + 1):
                 print(f"[attempt {attempt_index}/{options.attempts}] Codex đọc project và tạo patch")
@@ -139,25 +143,76 @@ class DebuggingPipeline:
                 attempt_dir.mkdir(parents=True, exist_ok=True)
                 try:
                     workspace.reset_to_snapshot()
+                    previous_patch_reapplied = False
+                    if previous_patch and previous_patch_paths:
+                        try:
+                            applied = workspace.apply_unified_diff(
+                                previous_patch,
+                                previous_patch_paths,
+                            )
+                            previous_patch_reapplied = applied == previous_patch_paths
+                        except Exception as exc:
+                            previous_feedback = {
+                                **(previous_feedback or {}),
+                                "error": (
+                                    "previous_candidate_reapply_failed:"
+                                    f"{type(exc).__name__}:{exc}"
+                                ),
+                                "candidate_paths": previous_patch_paths,
+                            }
                     self._write_baseline_context(workspace, baseline_snapshot)
-                    context_preparation = context_backend.prepare(
-                        workspace.path,
-                        attempt_dir / "context",
-                    )
-                    prompt = build_codex_prompt(
-                        project_id=project.project_id,
-                        attempt=attempt_index,
-                        failing_tests=options.failing_tests,
-                        previous_attempt=previous_feedback,
-                        baseline=baseline_snapshot,
-                        repository_context=context_preparation.prompt_context(),
-                    )
+                    if context_preparation is None:
+                        context_preparation = context_backend.prepare(
+                            workspace.path,
+                            attempt_dir / "context",
+                        )
+                        context_record = context_preparation.to_dict()
+                    else:
+                        context_record = {
+                            **context_preparation.to_dict(),
+                            "status": (
+                                "reused" if context_preparation.ready
+                                else context_preparation.status
+                            ),
+                            "elapsed_seconds": 0.0,
+                            "init_log_artifact": "",
+                            "status_log_artifact": "",
+                        }
+                        context_dir = attempt_dir / "context"
+                        context_dir.mkdir(parents=True, exist_ok=True)
+                        atomic_write_json(context_dir / "report.json", context_record)
+                    resumed_thread_id = codex_thread_id
+                    if resumed_thread_id:
+                        prompt = build_codex_retry_prompt(
+                            project_id=project.project_id,
+                            attempt=attempt_index,
+                            feedback=previous_feedback or {},
+                            previous_patch_reapplied=previous_patch_reapplied,
+                        )
+                    else:
+                        prompt = build_codex_prompt(
+                            project_id=project.project_id,
+                            attempt=attempt_index,
+                            failing_tests=options.failing_tests,
+                            previous_attempt=previous_feedback,
+                            baseline=baseline_snapshot,
+                            repository_context=context_preparation.prompt_context(),
+                        )
                     run = runner.run(
                         workspace=workspace.path,
                         prompt=prompt,
                         artifact_dir=attempt_dir,
                         tool_directories=context_preparation.tool_directories,
+                        thread_id=resumed_thread_id,
                     )
+                    if run.thread_id:
+                        codex_thread_id = run.thread_id
+                    thread_artifact = attempt_dir / "thread.json"
+                    atomic_write_json(thread_artifact, {
+                        "thread_id": codex_thread_id,
+                        "resumed": bool(resumed_thread_id),
+                        "previous_patch_reapplied": previous_patch_reapplied,
+                    })
                     payload_artifact = attempt_dir / "codex.payload.json"
                     atomic_write_json(payload_artifact, run.payload)
                     base_attempt = {
@@ -166,7 +221,13 @@ class DebuggingPipeline:
                         "codex_error": run.error,
                         "codex_returncode": run.returncode,
                         "elapsed_seconds": round(run.elapsed_seconds, 3),
-                        "repository_context": context_preparation.to_dict(),
+                        "repository_context": context_record,
+                        "codex_thread_id": codex_thread_id,
+                        "codex_thread_resumed": bool(resumed_thread_id),
+                        "previous_patch_reapplied": previous_patch_reapplied,
+                        "codex_thread_artifact": str(
+                            thread_artifact.relative_to(project_results)
+                        ),
                         "response": run.payload,
                         "codex_response_artifact": str(
                             payload_artifact.relative_to(project_results)
@@ -214,6 +275,8 @@ class DebuggingPipeline:
                         )
                         previous_feedback = {"error": error}
                         continue
+                    previous_patch = canonical_diff
+                    previous_patch_paths = list(patch_paths)
                     canonical_payload = deepcopy(run.payload)
                     canonical_payload.setdefault("repair", {})["diff"] = canonical_diff
                     base_attempt["response"] = canonical_payload
@@ -225,7 +288,11 @@ class DebuggingPipeline:
                         )
                         previous_feedback = {
                             "error": policy_error,
-                            "patch_paths": patch_paths,
+                            "candidate_paths": patch_paths,
+                            "previous_summary": canonical_payload.get("summary", ""),
+                            "previous_description": (
+                                canonical_payload.get("repair") or {}
+                            ).get("description", ""),
                         }
                         continue
                     snapshot_hashes = workspace.snapshot_sha256s(patch_paths)
@@ -301,8 +368,12 @@ class DebuggingPipeline:
                         "error": snapshot.get("validation_error") or "tests_still_fail",
                         "outcome": snapshot.get("status"),
                         "failed_tests": snapshot.get("failed_test_ids", []),
-                        "test_output": snapshot.get("failure_output", ""),
-                        "previous_patch": canonical_diff,
+                        "failure_excerpt": snapshot.get("failure_output", ""),
+                        "candidate_paths": patch_paths,
+                        "previous_summary": canonical_payload.get("summary", ""),
+                        "previous_description": (
+                            canonical_payload.get("repair") or {}
+                        ).get("description", ""),
                     }
                 except Exception as exc:
                     error = f"attempt_exception:{type(exc).__name__}:{exc}"
@@ -333,6 +404,7 @@ class DebuggingPipeline:
                 "output_patch": str(output_patch) if published else "",
                 "workspace_patch_artifact": latest["artifact"],
                 "repair": latest["repair"],
+                "codex_thread_id": codex_thread_id,
                 "patch_validation_passed": False,
                 "baseline": baseline_snapshot,
                 "attempts": attempts,
@@ -364,6 +436,9 @@ class DebuggingPipeline:
                 ),
                 "codex_events_artifact": terminal_attempt.get("codex_events_artifact", ""),
                 "codex_stderr_artifact": terminal_attempt.get("codex_stderr_artifact", ""),
+                "codex_thread_id": terminal_attempt.get(
+                    "codex_thread_id", codex_thread_id
+                ),
                 "patch_validation_passed": False,
                 "baseline": baseline_snapshot,
                 "attempts": attempts,
@@ -408,6 +483,7 @@ class DebuggingPipeline:
             "codex_response_artifact": candidate.get("codex_response_artifact", ""),
             "codex_events_artifact": candidate.get("codex_events_artifact", ""),
             "codex_stderr_artifact": candidate.get("codex_stderr_artifact", ""),
+            "codex_thread_id": candidate.get("codex_thread_id", ""),
             "patch_validation_passed": candidate.get("status") == "plausible",
             "test_oracle_modified": bool(candidate.get("test_oracle_modified", False)),
             "blocked_patch_paths": candidate.get("blocked_patch_paths", []),

@@ -18,6 +18,7 @@ class CodexRunResult:
     returncode: int = -1
     elapsed_seconds: float = 0.0
     command: list[str] = field(default_factory=list)
+    thread_id: str = ""
 
 
 class CodexRunner:
@@ -55,6 +56,7 @@ class CodexRunner:
         prompt: str,
         artifact_dir: Path,
         tool_directories: tuple[Path, ...] = (),
+        thread_id: str = "",
     ) -> CodexRunResult:
         artifact_dir.mkdir(parents=True, exist_ok=True)
         prompt_path = artifact_dir / "prompt.txt"
@@ -63,58 +65,11 @@ class CodexRunner:
         response_path = artifact_dir / "response.json"
         prompt_path.write_text(prompt, encoding="utf-8")
 
-        command = [
-            self.executable,
-            "exec",
-            "--cd",
-            str(workspace),
-            "--sandbox",
-            "workspace-write",
-            "--ephemeral",
-            "--json",
-            "--color",
-            "never",
-            "--output-schema",
-            str(self.schema_path),
-            "--output-last-message",
-            str(response_path),
-            "-c",
-            "approval_policy=\"never\"",
-            "-c",
-            "sandbox_workspace_write.network_access=true",
-        ]
-        if not self.inherit_user_config:
-            command.extend(["--ignore-user-config", "--ignore-rules"])
-        # Keep the Codex CLI harness and agent loop, while allowing the model
-        # backend to be configured entirely from this project's .env. These
-        # are CLI config overrides, not a direct OpenRouter API call.
-        if self.provider:
-            command.extend(["-c", f"model_provider={_toml_string(self.provider)}"])
-            provider_prefix = f"model_providers.{self.provider}"
-            command.extend(
-                [
-                    "-c",
-                    f"{provider_prefix}.name={_toml_string(self.provider)}",
-                    "-c",
-                    f"{provider_prefix}.env_key={_toml_string(self.env_key)}",
-                ]
-            )
-            if self.base_url:
-                command.extend(
-                    [
-                        "-c",
-                        f"{provider_prefix}.base_url={_toml_string(self.base_url)}",
-                    ]
-                )
-            if self.wire_api:
-                command.extend(
-                    [
-                        "-c",
-                        f"{provider_prefix}.wire_api={_toml_string(self.wire_api)}",
-                    ]
-                )
-        if self.model:
-            command.extend(["--model", self.model])
+        command = self._command(
+            workspace=workspace,
+            response_path=response_path,
+            thread_id=thread_id,
+        )
         command.append("-")
 
         started = time.monotonic()
@@ -170,6 +125,7 @@ class CodexRunner:
                     except ProcessLookupError:
                         pass
                 stdout, stderr = process.communicate()
+                active_thread_id = _extract_thread_id(stdout) or thread_id
                 events_path.write_text(stdout or "", encoding="utf-8")
                 stderr_path.write_text(stderr or "", encoding="utf-8")
                 return CodexRunResult(
@@ -178,6 +134,7 @@ class CodexRunner:
                     returncode=process.returncode or -1,
                     elapsed_seconds=time.monotonic() - started,
                     command=command,
+                    thread_id=active_thread_id,
                 )
         except OSError as exc:
             return CodexRunResult(
@@ -185,11 +142,13 @@ class CodexRunner:
                 error=f"codex_start_error:{exc}",
                 elapsed_seconds=time.monotonic() - started,
                 command=command,
+                thread_id=thread_id,
             )
 
         events_path.write_text(stdout or "", encoding="utf-8")
         stderr_path.write_text(stderr or "", encoding="utf-8")
         elapsed = time.monotonic() - started
+        active_thread_id = _extract_thread_id(stdout) or thread_id
         if process.returncode != 0:
             tail = "\n".join((stderr or stdout or "").splitlines()[-20:])
             return CodexRunResult(
@@ -198,6 +157,7 @@ class CodexRunner:
                 returncode=process.returncode,
                 elapsed_seconds=elapsed,
                 command=command,
+                thread_id=active_thread_id,
             )
         try:
             payload = json.loads(response_path.read_text(encoding="utf-8"))
@@ -208,6 +168,7 @@ class CodexRunner:
                 returncode=process.returncode,
                 elapsed_seconds=elapsed,
                 command=command,
+                thread_id=active_thread_id,
             )
         error = _validate_payload(payload)
         return CodexRunResult(
@@ -217,7 +178,82 @@ class CodexRunner:
             returncode=process.returncode,
             elapsed_seconds=elapsed,
             command=command,
+            thread_id=active_thread_id,
         )
+
+    def _command(
+        self,
+        *,
+        workspace: Path,
+        response_path: Path,
+        thread_id: str = "",
+    ) -> list[str]:
+        """Build an initial or resumed non-interactive Codex command.
+
+        Initial attempts persist their session so later validation feedback can
+        continue the same reasoning thread. Resumed commands intentionally omit
+        ``--cd`` and ``--sandbox`` because those values belong to the recorded
+        session and are not accepted by ``codex exec resume``.
+        """
+        if thread_id:
+            command = [self.executable, "exec", "resume"]
+        else:
+            command = [
+                self.executable,
+                "exec",
+                "--cd",
+                str(workspace),
+                "--sandbox",
+                "workspace-write",
+                "--color",
+                "never",
+            ]
+        command.extend([
+            "--json",
+            "--output-schema",
+            str(self.schema_path),
+            "--output-last-message",
+            str(response_path),
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "sandbox_workspace_write.network_access=true",
+        ])
+        if not self.inherit_user_config:
+            command.extend(["--ignore-user-config", "--ignore-rules"])
+        # Keep the Codex CLI harness and agent loop, while allowing the model
+        # backend to be configured entirely from this project's .env. These
+        # are CLI config overrides, not a direct OpenRouter API call.
+        if self.provider:
+            command.extend(["-c", f"model_provider={_toml_string(self.provider)}"])
+            provider_prefix = f"model_providers.{self.provider}"
+            command.extend(
+                [
+                    "-c",
+                    f"{provider_prefix}.name={_toml_string(self.provider)}",
+                    "-c",
+                    f"{provider_prefix}.env_key={_toml_string(self.env_key)}",
+                ]
+            )
+            if self.base_url:
+                command.extend(
+                    [
+                        "-c",
+                        f"{provider_prefix}.base_url={_toml_string(self.base_url)}",
+                    ]
+                )
+            if self.wire_api:
+                command.extend(
+                    [
+                        "-c",
+                        f"{provider_prefix}.wire_api={_toml_string(self.wire_api)}",
+                    ]
+                )
+        if self.model:
+            command.extend(["--model", self.model])
+        if thread_id:
+            command.append(thread_id)
+        return command
 
 
 def _validate_payload(payload: object) -> str:
@@ -234,6 +270,21 @@ def _validate_payload(payload: object) -> str:
         or any(not isinstance(path, str) or not path.strip() for path in paths)
     ):
         return "codex_response_missing_repair_paths"
+    return ""
+
+
+def _extract_thread_id(events: str) -> str:
+    """Return the persisted Codex thread id from a JSONL event stream."""
+    for line in str(events or "").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "thread.started":
+            continue
+        thread_id = str(event.get("thread_id") or "").strip()
+        if thread_id:
+            return thread_id
     return ""
 
 

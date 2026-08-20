@@ -146,13 +146,14 @@ Framework sẽ:
 
 1. Nhận failure log và failing test IDs do caller cung cấp, không chạy source gốc.
 2. Khóa Git project sạch do caller cung cấp, ghi branch/HEAD recovery metadata và chuẩn bị CodeGraph nếu khả dụng.
-3. Trước mỗi attempt, reset về baseline; cho Codex thực hiện FL và APR trực tiếp trong project từ failure log đã cung cấp.
+3. Ở attempt đầu, tạo một Codex thread có lưu session và cho Codex thực hiện FL/APR từ failure log cùng CodeGraph context.
 4. Lấy canonical Git diff từ thay đổi thật, reset rồi apply diff đó để setup/build/test.
-5. Nếu có `target_test`, chạy nó trước; target fail sẽ chuyển feedback sang attempt sau.
-6. Chỉ khi target pass mới chạy `regression_test` full suite.
-7. Nếu không có `target_test`, chạy thẳng full suite cho mỗi attempt.
-8. Ghi patch được chọn vào `/tmp/fix.patch`.
-9. Khôi phục branch/HEAD ban đầu và dọn build/runtime artifact do run tạo.
+5. Nếu validation chưa pass, reset baseline, reapply candidate gần nhất và `codex exec resume` đúng thread cũ với feedback rút gọn; không gửi lại failure log, CodeGraph context hay full diff.
+6. Nếu có `target_test`, chạy nó trước; target fail sẽ chuyển feedback sang attempt sau.
+7. Chỉ khi target pass mới chạy `regression_test` full suite.
+8. Nếu không có `target_test`, chạy thẳng full suite cho mỗi attempt.
+9. Ghi patch được chọn vào `/tmp/fix.patch`.
+10. Khôi phục branch/HEAD ban đầu và dọn build/runtime artifact do run tạo.
 
 Framework không copy source tree. Git project của đối tác phải sạch và không có
 ignored artifact, trừ `.debugging-framework/`. Nếu caller cung cấp một source
@@ -187,6 +188,7 @@ Các file thường cần xem:
 - `patch.diff`: patch được chọn.
 - `result.json`: trạng thái validation cuối cùng.
 - `attempts/attempt_NN/`: prompt, phản hồi Codex, canonical workspace patch và log.
+- `attempts/attempt_NN/thread.json`: thread ID, trạng thái resume và kết quả reapply candidate.
 
 Codex chỉ trả mô tả repair và danh sách path; Codex không phải tự chép diff vào
 JSON. Framework bổ sung canonical workspace diff vào `repair.diff` trong
