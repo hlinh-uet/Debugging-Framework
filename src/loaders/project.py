@@ -30,6 +30,6 @@ class ProjectLoader:
     ) -> Project:
         path = (project_path or Path.cwd()).expanduser().resolve()
         if not path.is_dir():
-            raise FileNotFoundError(f"Project không tồn tại hoặc không phải thư mục: {path}")
+            raise FileNotFoundError(f"Project does not exist or is not a directory: {path}")
         resolved_config = config_path.expanduser().resolve() if config_path else None
         return Project(path=path, project_id=path.name, config_path=resolved_config)

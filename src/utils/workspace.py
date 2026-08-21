@@ -246,7 +246,7 @@ class ProjectWorkspace:
         except ValueError:
             pass
         else:
-            raise WorkspaceError("Workspace metadata phải nằm ngoài project input")
+            raise WorkspaceError("Workspace metadata must be outside the input project")
         self.path = self.owner
         self.snapshot_commit = ""
         self.original_head = ""
@@ -284,8 +284,8 @@ class ProjectWorkspace:
                     and self.workspace_config.initialize_git_if_missing
                 ):
                     raise WorkspaceError(
-                        "Project không phải Git repository; chỉ source disposable được phép "
-                        "tự tạo baseline bằng workspace.disposable=true và "
+                        "Project is not a Git repository; only disposable source may "
+                        "create a baseline with workspace.disposable=true and "
                         "workspace.initialize_git_if_missing=true"
                     )
                 self._initialize_disposable_repository()
@@ -312,7 +312,7 @@ class ProjectWorkspace:
         if self._lock_handle is not None:
             return
         if not self.owner.is_dir():
-            raise WorkspaceError(f"Project không tồn tại: {self.owner}")
+            raise WorkspaceError(f"Project does not exist: {self.owner}")
         self.parent.mkdir(parents=True, exist_ok=True)
         self._acquire_lock()
         try:
@@ -329,7 +329,7 @@ class ProjectWorkspace:
     def preflight(self) -> dict[str, object]:
         """Check the in-place contract without changing the supplied project."""
         if not self.owner.is_dir():
-            raise WorkspaceError(f"Project không tồn tại: {self.owner}")
+            raise WorkspaceError(f"Project does not exist: {self.owner}")
         root = self._git_root()
         if root != self.owner:
             if not (
@@ -337,7 +337,8 @@ class ProjectWorkspace:
                 and self.workspace_config.initialize_git_if_missing
             ):
                 raise WorkspaceError(
-                    "Project không phải Git repository và chưa được cho phép tạo "
+                    "Project is not a Git repository and disposable baseline creation "
+                    "has not been authorized: "
                     "disposable baseline"
                 )
             return {
@@ -350,8 +351,8 @@ class ProjectWorkspace:
         )
         if status.strip():
             raise WorkspaceError(
-                "Git project phải sạch trước repair (tracked và untracked); "
-                "hãy commit/stash hoặc dùng một clone riêng"
+                "Git project must be clean before repair (tracked and untracked); "
+                "commit/stash the changes or use a separate clone"
             )
         ignored = self._git_text(
             "status", "--porcelain=v1", "--ignored=matching", "--untracked-files=all",
@@ -365,14 +366,14 @@ class ProjectWorkspace:
         if ignored_entries and not self.workspace_config.disposable:
             preview = ", ".join(line[3:] for line in ignored_entries[:5])
             raise WorkspaceError(
-                "Git project có ignored files nên không thể bảo đảm khôi phục in-place; "
-                f"hãy dùng clone sạch (ví dụ: {preview})"
+                "Git project contains ignored files, so in-place recovery cannot be guaranteed; "
+                f"use a clean clone (for example: {preview})"
             )
         head = self._git_text(
             "rev-parse", "--verify", "HEAD", timeout=30, allow_failure=True
         ).strip()
         if not head:
-            raise WorkspaceError("Git project chưa có commit baseline")
+            raise WorkspaceError("Git project has no baseline commit")
         return {
             "mode": "in_place",
             "git": "existing",
@@ -416,7 +417,7 @@ class ProjectWorkspace:
             self._release_lock()
             self._entered = False
         if restore_error is not None:
-            raise WorkspaceError(f"Không khôi phục được project input: {restore_error}") from restore_error
+            raise WorkspaceError(f"Could not restore the input project: {restore_error}") from restore_error
 
     @property
     def restored(self) -> bool:
@@ -446,7 +447,7 @@ class ProjectWorkspace:
         self._run_git("commit", "--no-gpg-sign", "-m", "Project snapshot", timeout=180)
         self.snapshot_commit = self._git_text("rev-parse", "HEAD", timeout=30).strip()
         if not self.snapshot_commit:
-            raise WorkspaceError("Không xác định được commit của project snapshot")
+            raise WorkspaceError("Could not determine the project snapshot commit")
         self._run_git("checkout", "--detach", "-f", self.snapshot_commit, timeout=120)
 
     def _prepare_existing_repository(self) -> None:
@@ -464,7 +465,7 @@ class ProjectWorkspace:
     def _assert_production_sources(self) -> None:
         files = self._git_paths("ls-tree", "-r", "--name-only", self.snapshot_commit)
         if not any(is_production_source_path(path, self.source_extensions) for path in files):
-            raise WorkspaceError("Project không có production source file được hỗ trợ")
+            raise WorkspaceError("Project has no supported production source files")
 
     def _git_root(self) -> Path | None:
         output = self._git_text(
@@ -521,11 +522,11 @@ class ProjectWorkspace:
             value = json.loads(self._recovery_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise WorkspaceError(
-                f"Không đọc được recovery metadata: {self._recovery_path}"
+                f"Could not read recovery metadata: {self._recovery_path}"
             ) from exc
         if str(value.get("project") or "") != str(self.owner):
             raise WorkspaceError(
-                "Recovery metadata không thuộc project hiện tại; không tự động thay đổi source"
+                "Recovery metadata does not belong to the current project; source will not be changed automatically"
             )
 
         framework_created = bool(value.get("framework_created_git", False))
@@ -538,8 +539,8 @@ class ProjectWorkspace:
                 self._recovery_path.unlink()
                 return
             raise WorkspaceError(
-                "Project Git đã biến mất trong khi còn recovery metadata; "
-                "cần kiểm tra thủ công"
+                "The project Git repository disappeared while recovery metadata remains; "
+                "manual inspection is required"
             )
 
         self.snapshot_commit = str(value.get("snapshot_commit") or "").strip()
@@ -555,13 +556,13 @@ class ProjectWorkspace:
                 self._recovery_path.unlink()
                 self.framework_created_git = False
                 return
-            raise WorkspaceError("Recovery metadata thiếu snapshot_commit")
+            raise WorkspaceError("Recovery metadata is missing snapshot_commit")
         recovered_commit = self._git_text(
             "rev-parse", "--verify", f"{self.snapshot_commit}^{{commit}}",
             timeout=30, allow_failure=True,
         ).strip()
         if not recovered_commit:
-            raise WorkspaceError("Không còn commit baseline để tự phục hồi project")
+            raise WorkspaceError("No baseline commit remains to restore the project automatically")
 
         if bool(value.get("exclude_recorded", False)):
             raw_path = self._git_text(
@@ -576,7 +577,7 @@ class ProjectWorkspace:
             try:
                 self._exclude_content = base64.b64decode(encoded, validate=True)
             except ValueError as exc:
-                raise WorkspaceError("Recovery metadata chứa exclude backup lỗi") from exc
+                raise WorkspaceError("Recovery metadata contains an invalid exclude backup") from exc
 
         try:
             self._restore_baseline(remove_generated=True)
@@ -595,7 +596,7 @@ class ProjectWorkspace:
             self._recovery_path.unlink()
         except Exception as exc:
             raise WorkspaceError(
-                f"Không tự phục hồi được repair bị ngắt: {exc}"
+                f"Could not automatically recover the interrupted repair: {exc}"
             ) from exc
         finally:
             # A successful recovery is followed by a completely fresh baseline.
@@ -619,7 +620,7 @@ class ProjectWorkspace:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             handle.close()
-            raise WorkspaceError(f"Project đang được một repair khác sử dụng: {self.owner}") from exc
+            raise WorkspaceError(f"Project is already being used by another repair: {self.owner}") from exc
         handle.seek(0)
         handle.truncate()
         handle.write(f"pid={os.getpid()}\nproject={self.owner}\n")
@@ -643,7 +644,7 @@ class ProjectWorkspace:
         entries, build output, and other untracked files are removed.
         """
         if not self.snapshot_commit:
-            raise WorkspaceError("Project snapshot chưa được khởi tạo")
+            raise WorkspaceError("Project snapshot has not been initialized")
         self._run_git("checkout", "--detach", "-f", self.snapshot_commit, timeout=120)
         self._run_git("reset", "--hard", self.snapshot_commit, timeout=120)
         self._run_git(
@@ -715,7 +716,7 @@ class ProjectWorkspace:
         for value in relpaths:
             relpath = normalize_relpath(value)
             if not relpath:
-                raise WorkspaceError(f"Patch path không an toàn: {value}")
+                raise WorkspaceError(f"Patch path is unsafe: {value}")
             completed = subprocess.run(
                 [
                     "git", "-C", str(self.path), "cat-file", "--filters",
@@ -766,7 +767,7 @@ class ProjectWorkspace:
         )
         if completed.returncode != 0:
             detail = completed.stderr.decode(errors="replace").strip()
-            raise WorkspaceError(f"git {' '.join(arguments)} lỗi: {detail}")
+            raise WorkspaceError(f"git {' '.join(arguments)} failed: {detail}")
         return [item.decode("utf-8", errors="replace") for item in completed.stdout.split(b"\0") if item]
 
     def _run_git(self, *arguments: str, timeout: int) -> None:
@@ -781,7 +782,7 @@ class ProjectWorkspace:
         if completed.returncode != 0 and not allow_failure:
             detail = (completed.stderr or completed.stdout).strip().splitlines()
             raise WorkspaceError(
-                f"git {' '.join(arguments[:3])} lỗi: {detail[-1] if detail else 'unknown'}"
+                f"git {' '.join(arguments[:3])} failed: {detail[-1] if detail else 'unknown'}"
             )
         return completed.stdout
 

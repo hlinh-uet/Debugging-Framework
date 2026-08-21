@@ -80,9 +80,9 @@ def read_project_config_file(path: Path) -> tuple[Path, dict[str, Any]]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Cấu hình project không hợp lệ {path}: {exc}") from exc
+        raise ValueError(f"Invalid project configuration {path}: {exc}") from exc
     if not isinstance(raw, dict):
-        raise ValueError(f"Cấu hình project phải là JSON object: {path}")
+        raise ValueError(f"Project configuration must be a JSON object: {path}")
     return path, raw
 
 
@@ -127,7 +127,7 @@ def _parse_repair(value: object, path: Path) -> RepairProjectConfig:
     if value is None:
         return RepairProjectConfig()
     if not isinstance(value, dict):
-        raise ValueError(f"{path}: repair phải là JSON object")
+        raise ValueError(f"{path}: repair must be a JSON object")
     _reject_unknown_fields(
         value,
         path,
@@ -163,7 +163,7 @@ def _parse_workspace(value: object, path: Path) -> WorkspaceProjectConfig:
     if value is None:
         return WorkspaceProjectConfig()
     if not isinstance(value, dict):
-        raise ValueError(f"{path}: workspace phải là JSON object")
+        raise ValueError(f"{path}: workspace must be a JSON object")
     _reject_unknown_fields(
         value,
         path,
@@ -182,7 +182,7 @@ def _parse_workspace(value: object, path: Path) -> WorkspaceProjectConfig:
     )
     if workspace.initialize_git_if_missing and not workspace.disposable:
         raise ValueError(
-            f"{path}: workspace.initialize_git_if_missing cần workspace.disposable=true"
+            f"{path}: workspace.initialize_git_if_missing requires workspace.disposable=true"
         )
     return workspace
 
@@ -191,7 +191,7 @@ def _parse_environment(value: object, path: Path) -> EnvironmentProjectConfig:
     if value is None:
         return EnvironmentProjectConfig()
     if not isinstance(value, dict):
-        raise ValueError(f"{path}: environment phải là JSON object")
+        raise ValueError(f"{path}: environment must be a JSON object")
     _reject_unknown_fields(value, path, "environment", {"mode", "runtime", "image"})
     environment = EnvironmentProjectConfig(
         mode=_choice(value.get("mode"), path, "environment.mode", ENVIRONMENT_MODES),
@@ -199,11 +199,11 @@ def _parse_environment(value: object, path: Path) -> EnvironmentProjectConfig:
         image=_optional_string(value.get("image"), path, "environment.image"),
     )
     if not environment.mode:
-        raise ValueError(f"{path}: environment.mode là bắt buộc (host hoặc image)")
+        raise ValueError(f"{path}: environment.mode is required (host or image)")
     if environment.mode == "image" and not environment.image:
-        raise ValueError(f"{path}: environment.image là bắt buộc với mode image")
+        raise ValueError(f"{path}: environment.image is required for image mode")
     if environment.mode == "host" and environment.image:
-        raise ValueError(f"{path}: environment.image chỉ dùng với mode image")
+        raise ValueError(f"{path}: environment.image can only be used with image mode")
     return environment
 
 
@@ -212,11 +212,11 @@ def _string_list(value: object, path: Path, name: str) -> tuple[str, ...]:
         return ()
     values = [value] if isinstance(value, str) else value
     if not isinstance(values, list):
-        raise ValueError(f"{path}: {name} phải là chuỗi hoặc list chuỗi")
+        raise ValueError(f"{path}: {name} must be a string or list of strings")
     output: list[str] = []
     for item in values:
         if not isinstance(item, str) or not item.strip():
-            raise ValueError(f"{path}: {name} không được chứa giá trị rỗng")
+            raise ValueError(f"{path}: {name} must not contain empty values")
         text = item.strip()
         if text not in output:
             output.append(text)
@@ -229,9 +229,9 @@ def _source_extensions(value: object, path: Path, name: str) -> tuple[str, ...]:
     for item in values:
         extension = item.lower()
         if not extension.startswith(".") or len(extension) < 2:
-            raise ValueError(f"{path}: {name} phải chứa extension dạng .ext")
+            raise ValueError(f"{path}: {name} must contain an extension in the form .ext")
         if any(character not in ".abcdefghijklmnopqrstuvwxyz0123456789_+-" for character in extension):
-            raise ValueError(f"{path}: {name} chứa extension không hợp lệ: {item}")
+            raise ValueError(f"{path}: {name} contains an invalid extension: {item}")
         if extension not in output:
             output.append(extension)
     return tuple(output)
@@ -241,7 +241,7 @@ def _optional_string(value: object, path: Path, name: str) -> str:
     if value is None:
         return ""
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{path}: {name} phải là chuỗi không rỗng")
+        raise ValueError(f"{path}: {name} must be a non-empty string")
     return value.strip()
 
 
@@ -249,7 +249,7 @@ def _choice(value: object, path: Path, name: str, allowed: frozenset[str]) -> st
     text = _optional_string(value, path, name)
     if text and text not in allowed:
         choices = ", ".join(sorted(allowed))
-        raise ValueError(f"{path}: {name} phải là một trong: {choices}")
+        raise ValueError(f"{path}: {name} must be one of: {choices}")
     return text
 
 
@@ -257,7 +257,7 @@ def _optional_int(value: object, path: Path, name: str, *, minimum: int) -> int 
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-        raise ValueError(f"{path}: {name} phải là số nguyên >= {minimum}")
+        raise ValueError(f"{path}: {name} must be an integer >= {minimum}")
     return value
 
 
@@ -265,7 +265,7 @@ def _optional_bool(value: object, path: Path, name: str) -> bool | None:
     if value is None:
         return None
     if not isinstance(value, bool):
-        raise ValueError(f"{path}: {name} phải là true hoặc false")
+        raise ValueError(f"{path}: {name} must be true or false")
     return value
 
 
@@ -274,4 +274,4 @@ def _reject_unknown_fields(
 ) -> None:
     unknown = sorted(str(key) for key in value if key not in allowed)
     if unknown:
-        raise ValueError(f"{path}: {name} có field không được hỗ trợ: {', '.join(unknown)}")
+        raise ValueError(f"{path}: {name} contains unsupported fields: {', '.join(unknown)}")

@@ -40,7 +40,7 @@ def build_parser(config: FrameworkConfig | None = None) -> argparse.ArgumentPars
     _ = config
     parser = argparse.ArgumentParser(
         prog="debugging-framework",
-        description="Nhận project, lưu raw unified patch và validation cách ly.",
+        description="Accept a project, save the raw unified patch, and run isolated validation.",
     )
     parser.add_argument("--results-dir", type=Path, default=argparse.SUPPRESS)
     parser.add_argument("--codex-bin", default=argparse.SUPPRESS)
@@ -62,18 +62,18 @@ def build_parser(config: FrameworkConfig | None = None) -> argparse.ArgumentPars
     sub = parser.add_subparsers(dest="command", required=True)
 
     inspect_parser = sub.add_parser(
-        "inspect", help="Xem build/full-suite contract hoặc plan tự nhận diện, chưa chạy lệnh."
+        "inspect", help="Show the build/full-suite contract or auto-detected plan without running commands."
     )
     inspect_parser.add_argument(
         "project", type=Path, nargs="?",
-        help="Project root; mặc định là thư mục hiện tại.",
+        help="Project root; defaults to the current directory.",
     )
     inspect_parser.add_argument("--json", action="store_true")
     add_environment_options(inspect_parser)
 
     repair_parser = sub.add_parser(
         "repair",
-        help="FL/APR trên snapshot từ failure evidence đã cung cấp.",
+        help="Run FL/APR on a snapshot using the supplied failure evidence.",
     )
     repair_parser.add_argument(
         "--project", type=Path, default=argparse.SUPPRESS,
@@ -91,7 +91,7 @@ def build_parser(config: FrameworkConfig | None = None) -> argparse.ArgumentPars
     repair_parser.add_argument("--output", type=Path, default=argparse.SUPPRESS, help="File patch output.")
     add_repair_options(repair_parser)
 
-    validate_parser = sub.add_parser("validate", help="Build/test lại một unified diff trên project.")
+    validate_parser = sub.add_parser("validate", help="Validate a unified diff against the project.")
     validate_parser.add_argument("project", type=Path)
     validate_parser.add_argument("patch", type=Path)
     validate_parser.add_argument(
@@ -104,11 +104,11 @@ def build_parser(config: FrameworkConfig | None = None) -> argparse.ArgumentPars
     add_environment_options(validate_parser)
 
     doctor_parser = sub.add_parser(
-        "doctor", help="Kiểm tra Codex, environment và build/full-suite contract."
+        "doctor", help="Check Codex, the environment, and the build/full-suite contract."
     )
     doctor_parser.add_argument(
         "project", type=Path, nargs="?",
-        help="Project root; mặc định là thư mục hiện tại.",
+        help="Project root; defaults to the current directory.",
     )
     doctor_parser.add_argument(
         "--config", dest="project_config", type=Path, default=argparse.SUPPRESS,
@@ -118,22 +118,22 @@ def build_parser(config: FrameworkConfig | None = None) -> argparse.ArgumentPars
     add_environment_options(doctor_parser)
 
     init_parser = sub.add_parser(
-        "init", help="Tạo project config cho workflow `debugging-framework repair` một lệnh."
+        "init", help="Create a project config for the one-command `debugging-framework repair` workflow."
     )
     init_parser.add_argument(
-        "project", type=Path, nargs="?", help="Project root; mặc định là thư mục hiện tại."
+        "project", type=Path, nargs="?", help="Project root; defaults to the current directory."
     )
     init_parser.add_argument(
         "--failing-test", "--test-id", dest="failing_tests", action="append",
         default=argparse.SUPPRESS,
-        help="Test ID để ghi sẵn vào repair.failing_tests; có thể lặp option.",
+        help="Test ID to prefill in repair.failing_tests; this option may be repeated.",
     )
     init_parser.add_argument(
         "--failure-output", dest="failing_output", type=Path, default=argparse.SUPPRESS,
-        help="Đường dẫn output fail, relative to project root (mặc định .debugging-framework/failure.log).",
+        help="Failing output path, relative to the project root (defaults to .debugging-framework/failure.log).",
     )
     init_parser.add_argument(
-        "--force", action="store_true", help="Thay thế repair settings hiện có, giữ build/test contract."
+        "--force", action="store_true", help="Replace existing repair settings while preserving the build/test contract."
     )
     add_environment_options(init_parser)
     return parser
@@ -179,36 +179,36 @@ def _prepare_repair_file_inputs(args: argparse.Namespace) -> None:
         return
     project = getattr(args, "project", None)
     if project is None:
-        raise ValueError("repair cần --project /path/to/buggy-project")
+        raise ValueError("repair requires --project /path/to/buggy-project")
     project = project.expanduser().resolve()
     if not project.is_dir():
-        raise FileNotFoundError(f"Project không tồn tại hoặc không phải thư mục: {project}")
+        raise FileNotFoundError(f"Project does not exist or is not a directory: {project}")
     configured = getattr(args, "project_config", None)
     if configured is None:
-        raise ValueError("repair cần --config /path/to/project-config.json")
+        raise ValueError("repair requires --config /path/to/project-config.json")
     configured = configured.expanduser()
     if configured.is_symlink():
-        raise ValueError("--config không được là symlink")
+        raise ValueError("--config must not be a symlink")
     configured = configured.resolve()
     if not configured.is_file():
-        raise FileNotFoundError(f"Project config không tồn tại: {configured}")
+        raise FileNotFoundError(f"Project config does not exist: {configured}")
 
     failure_output = getattr(args, "failing_output", None)
     if failure_output is None:
-        raise ValueError("repair cần --failure-output /path/to/failure_output.log")
+        raise ValueError("repair requires --failure-output /path/to/failure_output.log")
     if str(failure_output) == "-":
         raise ValueError(
-            "repair contract ba path không hỗ trợ stdin; "
-            "--failure-output phải là path tới file"
+            "The three-path repair contract does not support stdin; "
+            "--failure-output must be a file path"
         )
     failure_output = failure_output.expanduser()
     if failure_output.is_symlink():
-        raise ValueError("--failure-output không được là symlink")
+        raise ValueError("--failure-output must not be a symlink")
     failure_output = failure_output.resolve()
     if not failure_output.is_file():
-        raise FileNotFoundError(f"Failing-test output không tồn tại: {failure_output}")
+        raise FileNotFoundError(f"Failing-test output does not exist: {failure_output}")
     if failure_output == configured:
-        raise ValueError("--config và --failure-output phải là hai file khác nhau")
+        raise ValueError("--config and --failure-output must be different files")
 
     args.project = project
     args.project_config = configured
@@ -217,7 +217,7 @@ def _prepare_repair_file_inputs(args: argparse.Namespace) -> None:
         args.project_config_sha256 = hashlib.sha256(configured.read_bytes()).hexdigest()
         args.failure_output_sha256 = hashlib.sha256(failure_output.read_bytes()).hexdigest()
     except OSError as exc:
-        raise RuntimeError(f"Không đọc được repair input: {exc}") from exc
+        raise RuntimeError(f"Could not read repair input: {exc}") from exc
 
 
 def _validate_repair_config_contract(
@@ -228,7 +228,7 @@ def _validate_repair_config_contract(
         return
     if project_config.raw.get("schema_version") != PROJECT_CONFIG_SCHEMA_VERSION:
         raise ValueError(
-            f"{project_config.path}: repair contract yêu cầu "
+            f"{project_config.path}: the repair contract requires "
             f"schema_version={PROJECT_CONFIG_SCHEMA_VERSION}"
         )
     disallowed_overrides = {
@@ -240,26 +240,26 @@ def _validate_repair_config_contract(
     used = [flag for field, flag in disallowed_overrides.items() if hasattr(args, field)]
     if used:
         raise ValueError(
-            "Ba-path repair contract yêu cầu test/environment nằm trong --config; "
-            "không dùng CLI override: " + ", ".join(used)
+            "The three-path repair contract requires test/environment settings in --config; "
+            "do not use CLI overrides: " + ", ".join(used)
         )
     if not project_config.repair.failing_tests:
         raise ValueError(
-            f"{project_config.path}: repair.failing_tests là bắt buộc"
+            f"{project_config.path}: repair.failing_tests is required"
         )
     if not project_config.environment.mode:
         raise ValueError(
-            f"{project_config.path}: environment.mode là bắt buộc (host hoặc image)"
+            f"{project_config.path}: environment.mode is required (host or image)"
         )
     regression = project_config.raw.get("regression_test")
     if not regression or not isinstance(regression, (str, dict, list)):
         raise ValueError(
-            f"{project_config.path}: regression_test full suite là bắt buộc"
+            f"{project_config.path}: a full-suite regression_test is required"
         )
     if "test" in project_config.raw:
         raise ValueError(
-            f"{project_config.path}: field test không còn dùng trong schema "
-            f"{PROJECT_CONFIG_SCHEMA_VERSION}; hãy dùng regression_test"
+            f"{project_config.path}: the test field is no longer used in schema "
+            f"{PROJECT_CONFIG_SCHEMA_VERSION}; use regression_test"
         )
 
 
@@ -493,7 +493,7 @@ def init_project(project, args: argparse.Namespace, config: FrameworkConfig) -> 
     config_path, raw = read_project_config_data(project.path)
     if "repair" in raw and not args.force:
         raise ValueError(
-            f"{PROJECT_CONFIG_NAME} đã có repair settings; dùng --force để thay thế repair settings"
+            f"{PROJECT_CONFIG_NAME} already has repair settings; use --force to replace them"
         )
 
     failing_tests = normalize_failing_tests(getattr(args, "failing_tests", None))
@@ -528,13 +528,13 @@ def init_project(project, args: argparse.Namespace, config: FrameworkConfig) -> 
             getattr(args, "environment_image", "") or config.environment_image
         ).strip()
     if not environment_mode:
-        raise ValueError("init cần --environment host hoặc --environment image")
+        raise ValueError("init requires --environment host or --environment image")
     if environment_mode not in {"host", "image"}:
-        raise ValueError("init environment mode chỉ hỗ trợ host hoặc image; không fallback")
+        raise ValueError("init environment mode supports only host or image; no fallback")
     if environment_mode == "image" and not environment_image:
-        raise ValueError("init --environment image cần --environment-image")
+        raise ValueError("init --environment image requires --environment-image")
     if environment_mode == "host" and environment_image:
-        raise ValueError("--environment-image chỉ dùng với --environment image")
+        raise ValueError("--environment-image can only be used with --environment image")
     template = repair_config_template(
         failing_tests=failing_tests,
         environment_mode=environment_mode,
@@ -574,7 +574,7 @@ def init_project(project, args: argparse.Namespace, config: FrameworkConfig) -> 
         "failure_output": failure_output,
         "gitignore_updated": gitignore_updated,
         "next": (
-            "Ghi actual output vào failure_output rồi chạy: "
+            "Write the actual output to failure_output, then run: "
             f"debugging-framework repair --project {project.path} --config {config_path} "
             f"--failure-output {failure_path}"
         ),
@@ -604,7 +604,7 @@ def _command_contract_value(command: CommandSpec):
 def _portable_failure_output(value: Path | str, root: Path) -> str:
     raw = str(value).strip()
     if not raw or raw == "-":
-        raise ValueError("init cần file --failure-output, không hỗ trợ stdin trong project config")
+        raise ValueError("init requires a --failure-output file; stdin is not supported in project config")
     path = Path(raw).expanduser()
     if not path.is_absolute():
         return path.as_posix()
@@ -640,7 +640,7 @@ def _add_failure_output_to_gitignore(root: Path, configured_path: str) -> bool:
     try:
         current = gitignore.read_text(encoding="utf-8") if gitignore.is_file() else ""
     except OSError as exc:
-        raise RuntimeError(f"Không đọc được {gitignore}: {exc}") from exc
+        raise RuntimeError(f"Could not read {gitignore}: {exc}") from exc
     if entry in {line.strip() for line in current.splitlines()}:
         return False
     updated = current
@@ -659,25 +659,25 @@ def normalize_failing_tests(value) -> tuple[str, ...]:
     elif isinstance(value, (list, tuple)):
         values = list(value)
     else:
-        raise ValueError("failing_tests phải là chuỗi hoặc danh sách tên test")
+        raise ValueError("failing_tests must be a string or a list of test names")
     normalized = tuple(str(item).strip() for item in values if str(item).strip())
     return normalized
 
 
 def validate_repair_arguments(config: FrameworkConfig, settings: Settings, args) -> None:
     if config.require_api_key and not settings.codex_api_key:
-        raise ValueError("CODEX_API_KEY chưa được cấu hình")
+        raise ValueError("CODEX_API_KEY is not configured")
     if args.attempts < 1 or args.codex_timeout < 1 or args.command_timeout < 1:
-        raise ValueError("attempts/timeout phải >= 1")
+        raise ValueError("attempts/timeout must be >= 1")
     if args.jobs < 0:
-        raise ValueError("--jobs phải >= 0")
+        raise ValueError("--jobs must be >= 0")
     if not normalize_failing_tests(args.failing_tests):
         raise ValueError(
-            "cần ít nhất một repair.failing_tests trong "
+            "at least one repair.failing_tests entry is required in "
             f"{PROJECT_CONFIG_NAME}"
         )
     if args.failing_output is None:
-        raise ValueError("repair cần --failure-output /path/to/failure_output.log")
+        raise ValueError("repair requires --failure-output /path/to/failure_output.log")
 
 
 def read_failure_output(value: Path | str | None) -> str | None:
@@ -689,13 +689,13 @@ def read_failure_output(value: Path | str | None) -> str | None:
     else:
         path = Path(raw).expanduser().resolve()
         if not path.is_file():
-            raise FileNotFoundError(f"Failing-test output không tồn tại: {path}")
+            raise FileNotFoundError(f"Failing-test output does not exist: {path}")
         try:
             output = path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
-            raise RuntimeError(f"Không đọc được failing-test output {path}: {exc}") from exc
+            raise RuntimeError(f"Could not read failing-test output {path}: {exc}") from exc
     if not output.strip():
-        raise ValueError("Failing-test output không được rỗng")
+        raise ValueError("Failing-test output must not be empty")
     return output
 
 
@@ -741,7 +741,7 @@ def validate_patch(
 ) -> int:
     patch_path = patch_path.expanduser().resolve()
     if not patch_path.is_file():
-        raise FileNotFoundError(f"Patch không tồn tại: {patch_path}")
+        raise FileNotFoundError(f"Patch does not exist: {patch_path}")
     diff = patch_path.read_text(encoding="utf-8")
     artifact_dir = settings.results_dir / safe_name(project.project_id, 100) / "manual-validation"
     DebuggingPipeline._require_outside_input(
@@ -834,7 +834,7 @@ def doctor(settings: Settings, project, jobs: int) -> int:
         print(f"[OK] Codex CLI: {(completed.stdout or '').strip().splitlines()[-1]}")
     else:
         failures += 1
-        print(f"[FAIL] Không tìm thấy Codex CLI: {settings.codex_executable}")
+        print(f"[FAIL] Codex CLI not found: {settings.codex_executable}")
     context = CodeGraphBackend.from_settings(settings).probe()
     if context.mode == "off":
         print("[OK] CodeGraph context: disabled")
@@ -894,7 +894,7 @@ def doctor(settings: Settings, project, jobs: int) -> int:
                     print(f"[OK] {command.label}: {' '.join(command.argv)}")
             else:
                 failures += 1
-                print(f"[FAIL] Thiếu executable cho {command.label}: {binary}")
+                print(f"[FAIL] Missing executable for {command.label}: {binary}")
     except ValueError as exc:
         failures += 1
         print(f"[FAIL] Auto-detection: {exc}")
@@ -910,7 +910,7 @@ def _doctor_probe_error(argv: tuple[str, ...]) -> str:
             encoding="utf-8", errors="replace", timeout=30, check=False,
         )
         if completed.returncode != 0:
-            detail = (completed.stdout or "pytest không khả dụng").strip().splitlines()
+            detail = (completed.stdout or "pytest is unavailable").strip().splitlines()
             return detail[-1]
     return ""
 

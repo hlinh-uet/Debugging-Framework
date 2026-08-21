@@ -39,18 +39,18 @@ def read_env_file(path: Path = DEFAULT_ENV_FILE) -> dict[str, str]:
         if line.startswith("export "):
             line = line[len("export ") :].lstrip()
         if "=" not in line:
-            raise ValueError(f"{path}:{line_number}: dòng .env phải có KEY=VALUE")
+            raise ValueError(f"{path}:{line_number}: .env lines must contain KEY=VALUE")
         key, raw = line.split("=", 1)
         key = key.strip()
         if not key or not key.replace("_", "a").isalnum() or not key[0].isalpha():
-            raise ValueError(f"{path}:{line_number}: tên biến .env không hợp lệ")
+            raise ValueError(f"{path}:{line_number}: invalid .env variable name")
         values[key] = _parse_env_value(raw.strip(), path, line_number)
     unknown = sorted(
         key for key in values
         if key.startswith(("DEBUGGING_", "CODEX_")) and key not in KNOWN_ENV_KEYS
     )
     if unknown:
-        raise ValueError(f"Biến .env không được hỗ trợ: {', '.join(unknown)}")
+        raise ValueError(f"Unsupported .env variables: {', '.join(unknown)}")
     return values
 
 
@@ -61,9 +61,9 @@ def _parse_env_value(raw: str, path: Path, line_number: int) -> str:
         try:
             value = ast.literal_eval(raw)
         except (SyntaxError, ValueError) as exc:
-            raise ValueError(f"{path}:{line_number}: giá trị quote không hợp lệ") from exc
+            raise ValueError(f"{path}:{line_number}: invalid quoted value") from exc
         if not isinstance(value, str):
-            raise ValueError(f"{path}:{line_number}: giá trị phải là chuỗi")
+            raise ValueError(f"{path}:{line_number}: value must be a string")
         return value
     return raw.split(" #", 1)[0].rstrip()
 
@@ -82,16 +82,16 @@ def _bool(name: str, raw: str) -> bool:
         return True
     if value in {"0", "false", "no", "off"}:
         return False
-    raise ValueError(f"{name} phải là true/false; nhận {raw!r}")
+    raise ValueError(f"{name} must be true/false; got {raw!r}")
 
 
 def _int(name: str, raw: str, minimum: int) -> int:
     try:
         value = int(raw)
     except ValueError as exc:
-        raise ValueError(f"{name} phải là số nguyên; nhận {raw!r}") from exc
+        raise ValueError(f"{name} must be an integer; got {raw!r}") from exc
     if value < minimum:
-        raise ValueError(f"{name} phải >= {minimum}; nhận {value}")
+        raise ValueError(f"{name} must be >= {minimum}; got {value}")
     return value
 
 
@@ -105,7 +105,7 @@ def _path(raw: str, default: Path) -> Path:
 def _choice(name: str, raw: str, allowed: set[str]) -> str:
     value = raw.lower().strip()
     if value not in allowed:
-        raise ValueError(f"{name} phải là một trong: {', '.join(sorted(allowed))}")
+        raise ValueError(f"{name} must be one of: {', '.join(sorted(allowed))}")
     return value
 
 
@@ -205,24 +205,24 @@ class Settings:
 
     def validated(self) -> "Settings":
         if not self.output_schema.is_file():
-            raise FileNotFoundError(f"Thiếu Codex output schema: {self.output_schema}")
+            raise FileNotFoundError(f"Missing Codex output schema: {self.output_schema}")
         if not self.environment_backend:
             raise ValueError(
-                "Phải chọn rõ environment mode: --environment host hoặc image; "
-                "framework không fallback môi trường"
+                "Environment mode must be selected explicitly: --environment host or image; "
+                "the framework does not fall back between environments"
             )
         if self.environment_backend not in {"host", "image"}:
-            raise ValueError("Environment mode chỉ hỗ trợ host hoặc image")
+            raise ValueError("Environment mode supports only host or image")
         if self.environment_backend == "image" and not self.environment_image.strip():
             raise ValueError(
-                "DEBUGGING_ENVIRONMENT_IMAGE/--environment-image là bắt buộc với mode image"
+                "DEBUGGING_ENVIRONMENT_IMAGE/--environment-image is required for image mode"
             )
         if self.environment_backend == "host" and self.environment_image.strip():
-            raise ValueError("--environment-image chỉ được dùng với environment image")
+            raise ValueError("--environment-image can only be used with the image environment")
         if self.context_mode not in {"off", "auto", "required"}:
-            raise ValueError("Context mode chỉ hỗ trợ off, auto hoặc required")
+            raise ValueError("Context mode supports only off, auto, or required")
         if self.codegraph_timeout_seconds < 1:
-            raise ValueError("CodeGraph timeout phải >= 1")
+            raise ValueError("CodeGraph timeout must be >= 1")
         return Settings(
             results_dir=self.results_dir.expanduser().resolve(),
             codex_executable=self.codex_executable,

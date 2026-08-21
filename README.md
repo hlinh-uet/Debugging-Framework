@@ -1,33 +1,34 @@
 # Debugging Framework
 
-Framework tự động **Fault Localization (FL)** và **Automated Program Repair
-(APR)** cho project C/C++. Codex sửa trực tiếp Git project do caller cung cấp;
-framework lấy Git diff từ filesystem, reset baseline rồi apply và chạy test trước
-khi trả kết quả, sau đó khôi phục branch/HEAD ban đầu.
+The framework automates **Fault Localization (FL)** and **Automated Program Repair
+(APR)** for C/C++ projects. Codex edits the caller-supplied Git project directly;
+the framework obtains the Git diff from the filesystem, resets the baseline, applies
+and tests the diff before returning the result, and then restores the original branch/HEAD.
 
-CodeGraph 1.5.0 đã được đóng gói sẵn để hỗ trợ Codex điều hướng source code.
-Người dùng không cần cài Node.js, npm, npx hoặc CodeGraph riêng.
+CodeGraph 1.5.0 is bundled to help Codex navigate the source code.
+Users do not need to install Node.js, npm, npx, or CodeGraph separately.
 
-## Yêu cầu
+## Requirements
 
-- Python 3.10 trở lên.
+- Python 3.10 or later.
 - Git.
-- Codex CLI đã cài và đăng nhập bằng `codex login`.
-- Môi trường build/test của project C/C++:
-  - `host`: máy hiện tại đã có compiler, dependency và test tool; hoặc
-  - `image`: Docker/Podman image đã được chuẩn bị sẵn.
+- Codex CLI installed and authenticated with `codex login`.
+- A C/C++ project build/test environment:
+  - `host`: the current machine has the compiler, dependencies, and test tools; or
+  - `image`: a prepared Docker/Podman image.
 
-Framework không tự cài dependency, không tự build/pull image và không tự đổi
-giữa `host` và `image`.
+The framework does not install dependencies, build/pull images, or switch
+automatically between `host` and `image`.
 
-Trên macOS với Docker Desktop, validation copy project vào filesystem Linux
-tạm trong container trước khi chạy command rồi đồng bộ artifact trở lại. Cách
-này giữ đúng POSIX permission semantics cho các test dùng `access(2)`/`stat(2)`;
-đây là chi tiết của image backend, không tạo thêm source workspace trên host.
+On macOS with Docker Desktop, validation copies the project into a temporary
+Linux filesystem inside the container before running commands, then synchronizes
+the artifacts back. This preserves POSIX permission semantics for tests using
+`access(2)`/`stat(2)`; it is an image-backend detail and does not create another
+source workspace on the host.
 
-## Cài đặt
+## Installation
 
-### Cài wheel cho partner
+### Install the wheel for a partner
 
 ```bash
 pipx install /path/to/debugging_framework-0.7.0-py3-none-any.whl
@@ -35,16 +36,16 @@ codex login
 debugging-framework --help
 ```
 
-Wheel đã chứa CodeGraph cho macOS ARM64 và Linux x64. Trên platform khác,
-`DEBUGGING_CONTEXT_MODE=auto` sẽ bỏ qua CodeGraph và giữ nguyên luồng Codex
-FL/APR.
+The wheel includes CodeGraph for macOS ARM64 and Linux x64. On other platforms,
+`DEBUGGING_CONTEXT_MODE=auto` skips CodeGraph and preserves the Codex FL/APR flow.
 
-CodeGraph mặc định là zero-config: framework tự chọn runtime bundled, tạo index
-non-interactive trong project baseline, kiểm tra index rồi đưa lệnh `codegraph` vào phiên
-Codex. Framework không cài Git hook, daemon hoặc cấu hình CodeGraph toàn cục trên
-máy đối tác.
+CodeGraph is zero-config by default: the framework selects the bundled runtime,
+creates a non-interactive index in the project baseline, verifies the index, and
+makes the `codegraph` command available to the Codex session. The framework does
+not install Git hooks or daemons, or change global CodeGraph configuration on the
+partner's machine.
 
-### Cài từ source để phát triển
+### Install from source for development
 
 ```bash
 cd /path/to/Debugging-Framework
@@ -54,11 +55,11 @@ python -m pip install -e .
 codex login
 ```
 
-## Chạy repair từng bước
+## Run a repair step by step
 
-### Bước 1: khởi tạo project
+### Step 1: initialize the project
 
-Với môi trường `host`:
+For the `host` environment:
 
 ```bash
 cd /path/to/project
@@ -67,7 +68,7 @@ debugging-framework init \
   --test-id '<test-id>'
 ```
 
-Ví dụ với image đã có sẵn:
+Example using a prepared image:
 
 ```bash
 debugging-framework init \
@@ -76,17 +77,17 @@ debugging-framework init \
   --test-id '<test-id>'
 ```
 
-Lệnh này tự nhận diện workflow hiện tại để tạo **bản nháp contract**, đồng thời
-tạo thư mục chứa failure log:
+This command detects the current workflow to create a **draft contract**, and also
+creates the directory for the failure log:
 
 ```text
 .debugging-framework.json
 .debugging-framework/
 ```
 
-Đối tác cần kiểm tra lại `setup`, `build` và đặc biệt là `regression_test` trước
-khi chạy repair, rồi commit contract và `.gitignore` để working tree sạch. Failure
-log trong `.debugging-framework/` có thể giữ ignored. Ví dụ contract CMake/CTest:
+The partner should review `setup`, `build`, and especially `regression_test` before
+running a repair, then commit the contract and `.gitignore` to keep the working tree
+clean. The failure log in `.debugging-framework/` may remain ignored. Example CMake/CTest contract:
 
 ```json
 {
@@ -111,28 +112,28 @@ log trong `.debugging-framework/` có thể giữ ignored. Ví dụ contract CMa
 }
 ```
 
-### Bước 2: lưu output lỗi thực tế
+### Step 2: save the actual failure output
 
-Chạy failing test của project và lưu nguyên output vào:
+Run the project's failing test and save its complete output to:
 
 ```text
 .debugging-framework/failure.log
 ```
 
-File này phải không rỗng. Framework tin failure log và failing test IDs do caller
-cung cấp, dùng chúng làm failure evidence chính cho CodeGraph/Codex và không chạy
-test trên source gốc trước khi bắt đầu sửa.
+This file must not be empty. The framework trusts the caller-supplied failure log
+and failing test IDs, uses them as the primary failure evidence for CodeGraph/Codex,
+and does not run tests on the original source before editing begins.
 
-### Bước 3: kiểm tra môi trường
+### Step 3: check the environment
 
 ```bash
 debugging-framework doctor . --config .debugging-framework.json
 ```
 
-Kiểm tra các dòng `[FAIL]` trước khi chạy repair. Với CodeGraph mode `auto`,
-trạng thái `[WARN]` chỉ có nghĩa Codex sẽ dùng search/read thông thường.
+Check any `[FAIL]` lines before running the repair. With CodeGraph mode `auto`,
+a `[WARN]` status only means Codex will use ordinary search/read operations.
 
-### Bước 4: chạy FL + APR
+### Step 4: run FL + APR
 
 ```bash
 debugging-framework repair \
@@ -142,21 +143,22 @@ debugging-framework repair \
   --output /tmp/fix.patch
 ```
 
-Framework sẽ:
+The framework will:
 
-1. Nhận failure log và failing test IDs do caller cung cấp, không chạy source gốc.
-2. Khóa Git project sạch do caller cung cấp, ghi branch/HEAD recovery metadata và chuẩn bị CodeGraph nếu khả dụng.
-3. Trước mỗi attempt, reset về baseline; cho Codex thực hiện FL và APR trực tiếp trong project từ failure log đã cung cấp.
-4. Lấy canonical Git diff từ thay đổi thật, reset rồi apply diff đó để setup/build/test.
-5. Nếu có `target_test`, chạy nó trước; target fail sẽ chuyển feedback sang attempt sau.
-6. Chỉ khi target pass mới chạy `regression_test` full suite.
-7. Nếu không có `target_test`, chạy thẳng full suite cho mỗi attempt.
-8. Ghi patch được chọn vào `/tmp/fix.patch`.
-9. Khôi phục branch/HEAD ban đầu và dọn build/runtime artifact do run tạo.
+1. Accept the caller-supplied failure log and failing test IDs without running the original source.
+2. Lock the caller-supplied clean Git project, record branch/HEAD recovery metadata, and prepare CodeGraph when available.
+3. Reset to the baseline before each attempt; have Codex perform FL and APR directly in the project using the supplied failure log.
+4. Extract the canonical Git diff from the actual changes, reset, and apply that diff for setup/build/test.
+5. If `target_test` is configured, run it first; a target failure is passed as feedback to the next attempt.
+6. Run the full `regression_test` suite only after the target passes.
+7. If no `target_test` is configured, run the full suite directly for each attempt.
+8. Write the selected patch to `/tmp/fix.patch`.
+9. Restore the original branch/HEAD and clean up build/runtime artifacts created by the run.
 
-Framework không copy source tree. Git project của đối tác phải sạch và không có
-ignored artifact, trừ `.debugging-framework/`. Nếu caller cung cấp một source
-export không có Git, config phải xác nhận rõ đây là dữ liệu disposable:
+The framework does not copy the source tree. The partner's Git project must be clean
+and contain no ignored artifacts except `.debugging-framework/`. If the caller
+provides a source export without Git, the config must explicitly confirm that it is
+disposable data:
 
 ```json
 {
@@ -167,43 +169,44 @@ export không có Git, config phải xác nhận rõ đây là dữ liệu dispo
 }
 ```
 
-Khi đó framework tạo Git baseline tạm ngay trong source export và xóa metadata
-đó sau khi khôi phục project. Adapter benchmark như Defects4C dùng chế độ này.
-Trong lúc chạy, metadata khôi phục nằm ở
-`<results>/<project>/workspace-recovery.json`; nếu process/SSH bị ngắt, lần
-repair tiếp theo sẽ giữ cùng project lock và tự khôi phục baseline trước khi
-đụng tới artifact của run mới.
+The framework then creates a temporary Git baseline in the source export and removes
+that metadata after restoring the project. Benchmark adapters such as Defects4C use
+this mode. During a run, recovery metadata is stored at
+`<results>/<project>/workspace-recovery.json`; if the process/SSH connection is
+interrupted, the next repair keeps the same project lock and restores the baseline
+before touching artifacts from the new run.
 
-### Bước 5: xem kết quả
+### Step 5: review the results
 
-Kết quả đầy đủ mặc định nằm tại:
+The complete results are stored by default at:
 
 ```text
 ~/.local/state/debugging-framework/results/<project-name>/
 ```
 
-Các file thường cần xem:
+The files you will usually inspect are:
 
-- `patch.diff`: patch được chọn.
-- `result.json`: trạng thái validation cuối cùng.
-- `attempts/attempt_NN/`: prompt, phản hồi Codex, canonical workspace patch và log.
+- `patch.diff`: the selected patch.
+- `result.json`: the final validation status.
+- `attempts/attempt_NN/`: the prompt, Codex response, canonical workspace patch, and logs.
 
-Codex chỉ trả mô tả repair và danh sách path; Codex không phải tự chép diff vào
-JSON. Framework bổ sung canonical workspace diff vào `repair.diff` trong
-`result.json`, và dùng cùng nội dung cho validation lẫn `patch.diff`.
+Codex returns only a repair description and a list of paths; it does not need to
+copy the diff into JSON. The framework adds the canonical workspace diff to
+`repair.diff` in `result.json` and uses the same content for validation and
+`patch.diff`.
 
-Failure baseline chỉ đến từ caller nên không sinh artifact hoặc chạy command.
-Mỗi thư mục kết quả repair chỉ giữ `attempts/`, `patch.diff` (khi Codex tạo được
-candidate) và `result.json`.
+The failure baseline comes only from the caller, so it does not generate artifacts
+or run commands. Each repair result directory contains only `attempts/`,
+`patch.diff` (when Codex creates a candidate), and `result.json`.
 
-`status=plausible` luôn đòi hỏi full regression suite pass. Nếu contract có
-`target_test`, target cũng phải pass trước đó. Các trạng thái khác như
-`cleanfix`, `noisefix`, `nonefix`, `negfix` hoặc `invalid` cần được xem lại trong
+`status=plausible` always requires the full regression suite to pass. If the contract
+has `target_test`, the target must also pass first. Other statuses such as
+`cleanfix`, `noisefix`, `nonefix`, `negfix`, or `invalid` should be reviewed in
 `result.json`.
 
-## Cấu hình thường dùng
+## Common configuration
 
-Phần lớn cấu hình của một job nên đặt trong `.debugging-framework.json`:
+Most job configuration should be placed in `.debugging-framework.json`:
 
 ```json
 {
@@ -244,76 +247,77 @@ Phần lớn cấu hình của một job nên đặt trong `.debugging-framework
 }
 ```
 
-Các biến môi trường hữu ích:
+Useful environment variables:
 
-| Biến | Mặc định | Công dụng |
+| Variable | Default | Purpose |
 | --- | --- | --- |
-| `DEBUGGING_CODEX_BIN` | `codex` | Đường dẫn Codex CLI |
-| `DEBUGGING_CODEX_MODEL` | `gpt-5.6-sol` | Model dùng cho repair |
-| `DEBUGGING_RESULTS_DIR` | thư mục state của user | Nơi lưu kết quả |
-| `DEBUGGING_CONTEXT_MODE` | `auto` | Chế độ CodeGraph: `auto`, `required`, `off` |
-| `DEBUGGING_CODEGRAPH_TIMEOUT` | `3600` | Timeout chuẩn bị graph, tính bằng giây |
+| `DEBUGGING_CODEX_BIN` | `codex` | Codex CLI path |
+| `DEBUGGING_CODEX_MODEL` | `gpt-5.6-sol` | Model used for repair |
+| `DEBUGGING_RESULTS_DIR` | user state directory | Results location |
+| `DEBUGGING_CONTEXT_MODE` | `auto` | CodeGraph mode: `auto`, `required`, `off` |
+| `DEBUGGING_CODEGRAPH_TIMEOUT` | `3600` | Graph preparation timeout in seconds |
 
-Không cần cấu hình CodeGraph executable khi dùng bản wheel/repository đã đóng
-gói. Với workflow thông thường, không cần đặt bất kỳ biến CodeGraph nào; các
-biến trong bảng chỉ là override nâng cao.
+You do not need to configure the CodeGraph executable when using the bundled
+wheel/repository. For normal workflows, no CodeGraph variables are required; the
+variables in the table are advanced overrides only.
 
-### Chế độ CodeGraph
+### CodeGraph modes
 
-- `auto` — khuyến nghị: dùng CodeGraph khi sẵn sàng, tự fallback nếu lỗi.
-- `required` — dừng job nếu CodeGraph không sẵn sàng; phù hợp benchmark/A-B.
-- `off` — tắt CodeGraph và chạy đúng luồng Codex cũ.
+- `auto` — recommended: use CodeGraph when ready and fall back automatically if it fails.
+- `required` — stop the job if CodeGraph is unavailable; useful for benchmarks/A-B tests.
+- `off` — disable CodeGraph and use the original Codex flow.
 
-CodeGraph chỉ hỗ trợ điều hướng repository. Failure evidence, output schema,
-logic FL/APR và validation patch vẫn do framework hiện tại quyết định.
+CodeGraph supports repository navigation only. Failure evidence, the output schema,
+FL/APR logic, and patch validation remain controlled by the current framework.
 
-## Contract build/test của đối tác
+## Partner build/test contract
 
-Trong workflow `repair`, `regression_test` là bắt buộc và phải chạy full suite
-chính thức của project. `setup` và `build` có thể là list rỗng nếu image/host đã
-chuẩn bị artifact tương ứng. `target_test` là tùy chọn, chỉ dùng để fail nhanh;
-nó không thay thế full-suite validation.
+In the `repair` workflow, `regression_test` is required and must run the project's
+official full suite. `setup` and `build` may be empty lists when the image/host has
+the corresponding artifacts prepared. `target_test` is optional and is only for
+fast failure; it does not replace full-suite validation.
 
-Framework có thể nhận diện CMake, Meson, Make/Autotools, Bazel và Ninja để hỗ
-trợ lệnh `init` sinh bản nháp. Auto-detection không thay thế contract đã được
-đối tác duyệt. Xem contract trước khi chạy:
+The framework can detect CMake, Meson, Make/Autotools, Bazel, and Ninja to help
+`init` generate a draft. Auto-detection does not replace the contract approved by
+the partner. Inspect the contract before running:
 
 ```bash
 debugging-framework inspect /path/to/project --environment host
 ```
 
-Nếu không khai báo `target_test`, framework chạy thẳng `regression_test` đúng
-một lần. Framework không tự thêm `ctest -R`, không truyền test ID vào runner lạ
-và không chạy full suite giả làm target. `{test_id}` chỉ hợp lệ trong
-`target_test`; `regression_test` chứa placeholder này sẽ bị từ chối.
+If `target_test` is not declared, the framework runs `regression_test` directly
+exactly once. The framework does not add `ctest -R`, pass test IDs to unknown
+runners, or pretend that the full suite is a target. `{test_id}` is valid only in
+`target_test`; a `regression_test` containing this placeholder is rejected.
 
-Mỗi custom test command cần `evidence_pattern` chứng minh ít nhất một test đã
-thực sự chạy. Nên thêm `failure_pattern` nếu output lỗi của runner không theo
-format phổ biến. Command được chạy trực tiếp, không qua shell expansion.
+Each custom test command needs `evidence_pattern` to prove that at least one test
+actually ran. Add `failure_pattern` if the runner's failure output does not use a
+common format. Commands run directly without shell expansion.
 
-## Các lệnh khác
+## Other commands
 
 ```bash
-# Xem build/test plan, không chạy lệnh
+# Show the build/test plan without running commands
 debugging-framework inspect /path/to/project --environment host
 
-# Kiểm tra Codex, CodeGraph và environment
+# Check Codex, CodeGraph, and the environment
 debugging-framework doctor /path/to/project --environment host
 
-# Validate một patch có sẵn
+# Validate an existing patch
 debugging-framework validate /path/to/project /tmp/fix.patch --environment host
 ```
 
-## Dành cho maintainer
+## For maintainers
 
 ```bash
-# Build wheel để giao partner
+# Build the wheel for delivery to a partner
 python -m pip install build
 python -m build --wheel
 ```
 
-Wheel có kích thước khoảng 115 MB vì chứa hai CodeGraph runtime. Metadata và
-license của CodeGraph nằm trong `third_party/codegraph/`.
+The wheel is approximately 115 MB because it contains two CodeGraph runtimes.
+CodeGraph metadata and licenses are in `third_party/codegraph/`.
 
-Framework chỉ cho phép automatic repair thay đổi production C/C++ source/header.
-Patch sửa test, fixture hoặc build/test infrastructure sẽ bị validation từ chối.
+The framework allows automatic repair to change only production C/C++ source and
+header files. Patches that modify tests, fixtures, or build/test infrastructure are
+rejected by validation.

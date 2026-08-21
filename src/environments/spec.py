@@ -77,11 +77,11 @@ class EnvironmentResolver:
         backend = backend.strip().lower()
         image = image.strip()
         if backend not in {"host", "image"}:
-            raise ValueError("environment mode chỉ hỗ trợ host hoặc image; không fallback")
+            raise ValueError("environment mode supports only host or image; no fallback")
         if backend == "image" and not image:
-            raise ValueError("environment_image là bắt buộc với mode image")
+            raise ValueError("environment_image is required for image mode")
         if backend == "host" and image:
-            raise ValueError("environment_image chỉ được dùng với mode image")
+            raise ValueError("environment_image can only be used with image mode")
         root = root.resolve()
         manifests = sorted(
             path.name for path in root.iterdir() if path.is_file() and path.name in self._MANIFESTS

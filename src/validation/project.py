@@ -195,8 +195,8 @@ class BuildDetector:
                 (CommandSpec("ninja-test", ("ninja", "test")),),
             )
         raise ValueError(
-            "Không tự nhận diện được build/test workflow từ project. "
-            "Có thể thêm .debugging-framework.json ngay tại project root cho build system đặc thù."
+            "Could not automatically detect the build/test workflow from the project. "
+            "You can add .debugging-framework.json at the project root for a custom build system."
         )
 
     def _project_configuration(
@@ -222,7 +222,7 @@ class BuildDetector:
             if isinstance(value, (str, dict)):
                 value = [value]
             if not isinstance(value, list):
-                raise ValueError(f"{path}: field {phase} phải là command hoặc list")
+                raise ValueError(f"{path}: field {phase} must be a command or list")
             out = []
             for index, item in enumerate(value, start=1):
                 cwd = "."
@@ -239,20 +239,20 @@ class BuildDetector:
                 elif isinstance(command, list) and all(isinstance(arg, str) for arg in command):
                     argv = tuple(command)
                 else:
-                    raise ValueError(f"{path}: command {phase}[{index}] không hợp lệ")
+                    raise ValueError(f"{path}: command {phase}[{index}] is invalid")
                 if not argv or Path(cwd).is_absolute() or ".." in Path(cwd).parts:
-                    raise ValueError(f"{path}: command {phase}[{index}] không an toàn")
+                    raise ValueError(f"{path}: command {phase}[{index}] is unsafe")
                 if phase == "regression_test" and any(
                     "{test_id}" in argument for argument in argv
                 ):
                     raise ValueError(
-                        f"{path}: regression_test[{index}] phải chạy full suite, "
-                        "không được chứa {test_id}"
+                        f"{path}: regression_test[{index}] must run the full suite and "
+                        "must not contain {test_id}"
                     )
                 if evidence_pattern or failure_pattern:
                     if phase not in {"test", "target_test", "regression_test"}:
                         raise ValueError(
-                            f"{path}: evidence/failure pattern chỉ dùng cho test command"
+                            f"{path}: evidence/failure patterns can only be used for test commands"
                         )
                     for field_name, pattern in (
                         ("evidence_pattern", evidence_pattern),
@@ -264,7 +264,7 @@ class BuildDetector:
                             re.compile(pattern)
                         except re.error as exc:
                             raise ValueError(
-                                f"{path}: {field_name} test[{index}] không hợp lệ: {exc}"
+                                f"{path}: {field_name} for test[{index}] is invalid: {exc}"
                             ) from exc
                 out.append(
                     CommandSpec(
@@ -281,13 +281,13 @@ class BuildDetector:
             if declared_test:
                 raise ValueError(
                     f"{path}: schema_version={PROJECT_CONFIG_SCHEMA_VERSION} "
-                    "không dùng field test; "
-                    "hãy khai báo full suite bằng regression_test"
+                    "does not use the test field; "
+                    "declare the full suite with regression_test"
                 )
             if not regression_test:
                 raise ValueError(
                     f"{path}: schema_version={PROJECT_CONFIG_SCHEMA_VERSION} "
-                    "yêu cầu regression_test full suite"
+                    "requires a full-suite regression_test"
                 )
             effective_regression = regression_test
         else:
@@ -303,7 +303,7 @@ class BuildDetector:
         )
         if not plan.regression_test:
             raise ValueError(
-                f"{path}: cần ít nhất một regression_test command"
+                f"{path}: at least one regression_test command is required"
             )
         return plan
 
@@ -376,7 +376,7 @@ class BuildDetector:
             )
         if target is None and script is None:
             raise ValueError(
-                "Make project không khai báo target test/check/tests và không có test runner chuẩn"
+                "Make project does not declare a test/check/tests target and has no standard test runner"
             )
         test_command = (
             CommandSpec("make-test", ("make", target))
@@ -405,11 +405,11 @@ class ProjectValidator:
         self.command_timeout = command_timeout
         self.detector = BuildDetector(jobs=jobs)
         if environment_backend not in {"host", "image"}:
-            raise ValueError("environment mode chỉ hỗ trợ host hoặc image; không fallback")
+            raise ValueError("environment mode supports only host or image; no fallback")
         if environment_backend == "image" and not environment_image.strip():
-            raise ValueError("environment_image là bắt buộc với mode image")
+            raise ValueError("environment_image is required for image mode")
         if environment_backend == "host" and environment_image.strip():
-            raise ValueError("environment_image chỉ được dùng với mode image")
+            raise ValueError("environment_image can only be used with image mode")
         self.environment_backend = environment_backend
         self.environment_image = environment_image.strip()
         self.environment_runtime = OCIEnvironment(runtime=environment_runtime)
@@ -435,7 +435,7 @@ class ProjectValidator:
         plan = self.detector.detect(project.path, project.config_path)
         if not plan.regression_test:
             raise ValueError(
-                f"Không tìm thấy regression_test full-suite command cho project {project.path}"
+                f"No full-suite regression_test command found for project {project.path}"
             )
         return plan
 
@@ -1002,7 +1002,7 @@ class ProjectValidator:
             target.relative_to(owner)
         except ValueError:
             return
-        raise ValueError(f"Validation artifacts phải nằm ngoài input project: {target}")
+        raise ValueError(f"Validation artifacts must be outside the input project: {target}")
 
     def _run_plan(
         self,
@@ -1381,7 +1381,7 @@ class ProjectValidator:
             try:
                 cwd.relative_to(root)
             except ValueError as exc:
-                raise ValueError(f"Command cwd thoát khỏi project: {spec.cwd}") from exc
+                raise ValueError(f"Command cwd escapes the project: {spec.cwd}") from exc
             if not cwd.is_dir():
                 result = CommandResult(spec.label, list(spec.argv), str(cwd), 127, "cwd_missing", 0.0)
             else:

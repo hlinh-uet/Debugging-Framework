@@ -78,7 +78,7 @@ class DebuggingPipeline:
             workspace_manager.release_reservation()
             raise
 
-        print("[baseline] dùng failure log và test ID do caller cung cấp; không chạy source gốc")
+        print("[baseline] using the caller-supplied failure log and test IDs; the original source is not run")
         try:
             baseline_snapshot = self.validator.external_baseline(
                 project,
@@ -134,7 +134,7 @@ class DebuggingPipeline:
         previous_feedback: dict | None = None
         with workspace_manager as workspace:
             for attempt_index in range(1, options.attempts + 1):
-                print(f"[attempt {attempt_index}/{options.attempts}] Codex đọc project và tạo patch")
+                print(f"[attempt {attempt_index}/{options.attempts}] Codex is inspecting the project and creating a patch")
                 attempt_dir = project_results / "attempts" / f"attempt_{attempt_index:02d}"
                 attempt_dir.mkdir(parents=True, exist_ok=True)
                 try:
@@ -455,12 +455,12 @@ class DebuggingPipeline:
             ),
         ):
             if source is None:
-                raise ValueError(f"repair cần input file: {name}")
+                raise ValueError(f"repair requires an input file: {name}")
             source = source.expanduser().resolve()
             try:
                 content = source.read_bytes()
             except OSError as exc:
-                raise RuntimeError(f"Không đọc được input {source}: {exc}") from exc
+                raise RuntimeError(f"Could not read input {source}: {exc}") from exc
             digest = hashlib.sha256(content).hexdigest()
             if expected_sha256 and digest != expected_sha256:
                 raise RuntimeError(f"input_changed_during_startup:{name}")
@@ -468,13 +468,13 @@ class DebuggingPipeline:
     @staticmethod
     def _validate_request(options: PipelineOptions) -> None:
         if options.attempts < 1 or options.codex_timeout_seconds < 1:
-            raise ValueError("attempts/codex timeout phải >= 1")
+            raise ValueError("attempts/codex timeout must be >= 1")
         if not options.failing_tests:
-            raise ValueError("repair cần ít nhất một test ID")
+            raise ValueError("repair requires at least one test ID")
         if not str(options.external_baseline_output or "").strip():
-            raise ValueError("repair cần actual failing output không rỗng")
+            raise ValueError("repair requires non-empty actual failing output")
         if options.request_config_path is None or options.failure_output_path is None:
-            raise ValueError("repair cần project, config và failure output")
+            raise ValueError("repair requires a project, config, and failure output")
 
     @staticmethod
     def _finish(project_results: Path, result: dict) -> dict:
@@ -521,22 +521,22 @@ class DebuggingPipeline:
             target.resolve().relative_to(project_root.resolve())
         except ValueError:
             return
-        raise ValueError(f"{label} phải nằm ngoài input project: {target}")
+        raise ValueError(f"{label} must be outside the input project: {target}")
 
     @staticmethod
     def _prepare_output_target(output_patch: Path) -> None:
         if output_patch.suffix.lower() not in {".diff", ".patch"}:
             raise ValueError(
-                f"Patch output phải có đuôi .diff hoặc .patch: {output_patch}"
+                f"Patch output must have a .diff or .patch extension: {output_patch}"
             )
         if output_patch.is_dir():
-            raise ValueError(f"Patch output là một thư mục: {output_patch}")
+            raise ValueError(f"Patch output is a directory: {output_patch}")
         if output_patch.exists() or output_patch.is_symlink():
             try:
                 output_patch.unlink()
             except OSError as exc:
                 raise RuntimeError(
-                    f"Không thể dọn patch output cũ {output_patch}: {exc}"
+                    f"Could not remove the old patch output {output_patch}: {exc}"
                 ) from exc
 
     @staticmethod
